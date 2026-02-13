@@ -1,0 +1,18 @@
+(* ThreadLang prototype grammar (simplified) *)
+
+program        = "thread", ws, identifier, ws, "{", ws, context_block, ws, emit_block, ws, "}" ;
+
+context_block  = "context", ws, "{", ws, assignment, { ws, assignment }, ws, "}" ;
+assignment     = identifier, ws, "=", ws, string_literal ;
+
+emit_block     = "emit", ws, "text", ws, "{", ws, expression, ws, "}" ;
+expression     = term, { ws, "+", ws, term } ;
+term           = string_literal | context_ref | inputs_ref ;
+
+context_ref    = "context", ".", identifier ;
+inputs_ref     = "inputs", ".", identifier ;
+
+identifier     = letter, { letter | digit | "_" } ;
+string_literal = '"', { character - '"' }, '"' ;
+
+ws             = { " " | "\t" | "\n" | "\r" } ;

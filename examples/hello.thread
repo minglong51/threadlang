@@ -1,0 +1,9 @@
+thread Hello {
+  context {
+    greeting = "Hello"
+  }
+
+  emit text {
+    context.greeting + ", " + inputs.name + "!"
+  }
+}
