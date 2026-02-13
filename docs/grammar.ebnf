@@ -1,0 +1,23 @@
+(* ThreadLang v0.1 minimal grammar *)
+
+program         = "thread", IDENT, "{", { block }, "}" ;
+
+block           = context_block
+                | emit_block
+                | placeholder_block ;
+
+context_block   = "context", "{", { IDENT, "=", STRING }, "}" ;
+
+emit_block      = "emit", "text", "{", expr, "}" ;
+
+placeholder_block = ("inputs" | "rules" | "steps"), "{", opaque, "}" ;
+
+expr            = term, { "+", term } ;
+term            = STRING | variable_ref ;
+variable_ref    = ("context" | "inputs"), ".", IDENT ;
+
+IDENT           = letter, { letter | digit | "_" } ;
+STRING          = '"', { character }, '"' ;
+
+(* Opaque placeholder content is accepted by the implementation using brace depth. *)
+opaque          = { ? any token with balanced braces ? } ;
