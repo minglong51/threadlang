@@ -1,14 +1,7 @@
 """AST node definitions for ThreadLang."""
 
-from dataclasses import dataclass
-from typing import List, Union
-
-
-@dataclass(frozen=True)
-class Program:
-    thread_name: str
-    context: "ContextBlock"
-    emit: "EmitBlock"
+from dataclasses import dataclass, field
+from typing import List, Optional, Union
 
 
 @dataclass(frozen=True)
@@ -37,7 +30,14 @@ class InputsRef:
     name: str
 
 
-ExpressionTerm = Union[StringLiteral, ContextRef, InputsRef]
+@dataclass(frozen=True)
+class StepsRef:
+    """Reference to a prior step's output: `steps.<step_name>.output`."""
+
+    step_name: str
+
+
+ExpressionTerm = Union[StringLiteral, ContextRef, InputsRef, StepsRef]
 
 
 @dataclass(frozen=True)
@@ -46,6 +46,40 @@ class Expression:
 
 
 @dataclass(frozen=True)
+class Step:
+    """One ordered workflow transformation.
+
+    Today: a single `llm "<model>" { <prompt expression> }` body. Future:
+    other step kinds (e.g., transform, validate).
+    """
+
+    name: str
+    model: str
+    prompt: Expression
+
+
+@dataclass(frozen=True)
+class StepsBlock:
+    steps: List[Step] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class EmitBlock:
-    kind: str
+    """Final output expression.
+
+    kind=text  → emit text { <expression> } — string concat of terms.
+    kind=llm   → emit llm "<model>" { <prompt expression> } — call model,
+                 return its response as the program output.
+    """
+
+    kind: str  # "text" | "llm"
     expression: Expression
+    model: Optional[str] = None  # only set when kind == "llm"
+
+
+@dataclass(frozen=True)
+class Program:
+    thread_name: str
+    context: ContextBlock
+    steps: StepsBlock
+    emit: EmitBlock

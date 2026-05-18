@@ -1,78 +1,111 @@
 # ThreadLang
 
-A small, deterministic DSL exploration. Long-term direction is structured
-LLM-workflow programs (context → steps → emit, with trace events). **The v0
-prototype implements only the language skeleton** — parser, AST, deterministic
-runtime, and trace — without any LLM calls or network I/O.
-
-If you came expecting a working LLM-workflow language, ThreadLang isn't that
-yet. If you came looking at the *shape* of one — parser, AST, evaluator — read
-on.
-
-## What v0 actually does
-
-A program is `thread <Name> { context { ... } emit text { ... } }`. The
-context block binds string literals to names; the emit block concatenates
-string literals, `context.<name>`, and `inputs.<name>`.
+A small DSL for deterministic LLM-workflow programs. Execution is
+**parse → AST → runtime → emit**, with structured trace events at every phase.
 
 ```thread
-thread Hello {
+thread TwoStep {
   context {
-    greeting = "Hello"
+    audience = "a curious 10-year-old"
+  }
+
+  steps {
+    step extract {
+      llm "claude-haiku-4-5-20251001" {
+        "Extract the three most important claims from this text. Reply as a numbered list, no preamble. Text:\n" + inputs.text
+      }
+    }
+    step retell {
+      llm "claude-haiku-4-5-20251001" {
+        "Rewrite the following claims for " + context.audience + ". Keep the meaning, change the words. Claims:\n" + steps.extract.output
+      }
+    }
   }
 
   emit text {
-    context.greeting + ", " + inputs.name + "!"
+    steps.retell.output
   }
 }
 ```
 
-```
-$ threadlang examples/hello.thread --input name=world
-Hello, world!
-```
+## Install
 
-That is the entire language surface today.
-
-## What's deliberately not in v0
-
-Per [`docs/spec.md`](docs/spec.md), v0 lists these as non-goals:
-
-- Real LLM integration
-- Network calls
-- External dependencies (Python stdlib only)
-- Loops, recursion, types
-
-The `rules` and `steps` blocks named in the language sketch below are
-**planned** — not parsed, not implemented.
-
-## Language sketch (the larger shape)
-
-```
-context  — deterministic values available during execution      [v0: yes]
-rules    — constraints and invariants                            [v0: no]
-steps    — ordered workflow transformations (LLM calls etc.)     [v0: no]
-emit     — final output expressions                              [v0: text only]
+```bash
+pip install threadlang                   # core only
+pip install 'threadlang[anthropic]'      # + AnthropicClient (real Claude calls)
 ```
 
-Execution model: **parse → AST → runtime → emit → trace**.
+## Run
+
+```bash
+# v0 string interpolation (no LLM)
+threadlang examples/hello.thread --input name=world
+# → Hello, world!
+
+# v1 with a real Claude call (needs ANTHROPIC_API_KEY)
+threadlang examples/summarize.thread --input text="The cat sat on the mat..."
+
+# v1 dry-run — works without an API key; LLM calls are deterministic echoes
+threadlang examples/two_step.thread --input text="..." --dry-run
+
+# show structured trace events
+threadlang examples/two_step.thread --input text="..." --dry-run --trace
+```
+
+## Language
+
+```
+context   — deterministic values available during execution     [v1: yes]
+steps     — ordered LLM transformations                         [v1: yes]
+emit text — string concatenation over expression terms          [v1: yes]
+emit llm  — call a model with a rendered prompt                 [v1: yes]
+rules     — constraints and invariants                          [planned]
+```
+
+Expression terms (joined with `+`):
+
+- string literal: `"hello"`
+- context value: `context.<name>`
+- input value: `inputs.<name>`
+- prior step output: `steps.<step_name>.output`
+
+Full grammar in [`docs/grammar.ebnf`](docs/grammar.ebnf); semantics in
+[`docs/spec.md`](docs/spec.md).
+
+## What v1 deliberately does not have
+
+Per the spec: loops, recursion, branching, streaming, tool use, system
+prompts, real type system. Held narrow on purpose. Each one is a real
+addition with its own design surface; v1 wanted the workflow shape to
+actually run end-to-end before expanding.
 
 ## Project shape
 
-- Zero runtime dependencies.
+- Zero runtime dependencies. `anthropic` is an *optional* extra; the
+  `DryRunClient` lets you run any program without it.
 - Frozen dataclass AST nodes (`src/threadlang/ast.py`).
-- Regex-driven parser (`src/threadlang/parser.py`) — narrow, explicit, no
-  parser-generator dependency.
-- Deterministic runtime (`src/threadlang/runtime.py`) returns `(output,
-  trace)`. Every evaluation step appends a structured `TraceEvent`.
-- Golden test (`tests/test_golden_hello.py`) parses + runs the example and
-  asserts the literal output.
+- Regex-driven parser (`src/threadlang/parser.py`) — small enough that a
+  parser-generator dependency would be cost without benefit.
+- Deterministic runtime (`src/threadlang/runtime.py`) returns
+  `(output, trace, step_outputs)`. Every context binding, step call, and
+  expression term appends a `TraceEvent`.
+- LLM-client protocol (`src/threadlang/llm.py`) — implement
+  `complete(model, prompt) -> str` to plug in any backend (OpenAI,
+  Ollama, etc.).
+- 10 tests (`tests/`) cover v0 backward-compat, emit-llm rendering, step
+  chaining, forward-reference / duplicate-name errors, exception
+  wrapping, and the dry-run protocol.
 
 ## Roadmap
 
-v1 (next): `steps` block + `emit llm "<model>" { ... }` so the language can
-actually call a model. That's when the "AI-native DSL" framing earns the
-name; until then, this is a compiler skeleton.
+Next likely additions, ordered by useful-surface ranking:
+
+- `rules` block — pre-/post-conditions per step (e.g., output regex
+  constraints, length bounds). Rejection retriggers the step with a
+  feedback prompt up to N times.
+- Multiple emit blocks (`emit text { ... } emit json { ... }`).
+- System-prompt declarations per `llm` call.
+- Hand-written recursive-descent parser when the grammar outgrows regex.
 
 ## License
 

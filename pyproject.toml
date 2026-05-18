@@ -4,12 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "threadlang"
-version = "0.1.0"
-description = "Experimental AI-native DSL for structured LLM workflows"
+version = "0.2.0"
+description = "A small DSL for deterministic LLM-workflow programs"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "ThreadLang Contributors" }]
 license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+anthropic = ["anthropic>=0.40,<1.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -1,0 +1,22 @@
+thread TwoStep {
+  context {
+    audience = "a curious 10-year-old"
+  }
+
+  steps {
+    step extract {
+      llm "claude-haiku-4-5-20251001" {
+        "Extract the three most important claims from this text. Reply as a numbered list, no preamble. Text:\n" + inputs.text
+      }
+    }
+    step retell {
+      llm "claude-haiku-4-5-20251001" {
+        "Rewrite the following claims for " + context.audience + ". Keep the meaning, change the words. Claims:\n" + steps.extract.output
+      }
+    }
+  }
+
+  emit text {
+    steps.retell.output
+  }
+}
