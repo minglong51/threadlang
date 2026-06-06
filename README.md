@@ -17,7 +17,10 @@ read-only [**observability dashboard**](#observability-v06) — a run list and a
 per-run trace timeline. As of **v0.7** there is a first product on the stack: a
 [**support-triage app**](#vertical-slice-support-triage-v07) that classifies a
 ticket, searches a knowledge base, and drafts a reply — durable, queued, and
-inspectable like any other run. Build plans: [`docs/design/`](docs/design/).
+inspectable like any other run. As of **v0.8** every run has
+[**metrics**](#metrics-v08) — a deterministic-vs-observational view *derived
+from* the trace (`GET /metrics`), so monitoring and data-driven iteration read
+the same events the timeline does. Build plans: [`docs/design/`](docs/design/).
 
 ```thread
 thread TwoStep {
@@ -256,6 +259,40 @@ allow-listed tool, the whole product runs end-to-end under `--dry-run` and is
 golden-tested. Details:
 [`docs/design/phase-5-vertical-slice.md`](docs/design/phase-5-vertical-slice.md).
 
+## Metrics (v0.8)
+
+Metrics are a **derived view of the trace, never a separately-reported number.**
+Every metric is a pure fold over the persisted `TraceEvent` stream, so it cannot
+drift from what the dashboard timeline shows, and adding a new metric gives it
+to every historical run for free. Two kinds, kept deliberately apart:
+
+- **Deterministic** — pure functions of control flow (steps completed, model
+  calls, tool calls/errors, resumed steps). Reproducible given the same inputs
+  and model responses.
+- **Observational** — wall-clock latency and token counts. Not reproducible;
+  recorded for monitoring but never mixed into the deterministic core. A `None`
+  token count means "not recorded", distinct from a real zero.
+
+```bash
+# per-run metrics on the CLI (with --store, includes wall-clock latency)
+threadlang examples/agent.thread --dry-run --input task=… --store runs.db --metrics
+```
+
+| Path | Returns |
+|---|---|
+| `GET /metrics` | aggregate rollup — success rate, avg latency, model/tool-call volume, per-program breakdown |
+| `GET /runs/{id}/metrics` | one run's `{deterministic, observational}` metrics |
+
+The dashboard shows the aggregate panel atop the run list and per-run metric
+chips on each detail page — same numbers, same source events. `metrics.py`
+holds the pure `compute_metrics(trace) -> RunMetrics` fold and `aggregate(...)`;
+the store layer adds an `events.ts` column (wall-clock at append) and
+`run_metrics` / `aggregate_metrics` query helpers. Token capture from the live
+clients is the one piece deferred: the worker pool shares one client and
+requires it hold no mutable per-call state, so usage will ride a future
+return-shape change rather than client-side state — the fold already reads
+`data.usage` the moment it appears.
+
 ## Language
 
 ```
@@ -336,6 +373,10 @@ The remaining layers each keep the determinism/trace bet:
 5. **Vertical-slice app** *(v0.7, shipped)* — a support-triage product on the
    stack (agent classify + KB search → llm draft), proving the layers compose
    end to end with no new core machinery.
+6. **Metrics** *(v0.8, shipped)* — deterministic + observational metrics
+   *derived* from the persisted trace (`metrics.py`), surfaced per-run and as an
+   aggregate rollup on the dashboard and `GET /metrics`. The substrate a
+   data-driven self-improvement loop reads.
 
 ## License
 

@@ -33,6 +33,7 @@ from typing import Dict, List, Optional
 
 from .ast import Program
 from .llm import LLMClient
+from .metrics import AggregateMetrics, RunMetrics, aggregate, compute_metrics, trace_span_ms
 from .runtime import RuntimeResult, run_program
 from .tools import ToolRegistry
 from .trace import Trace, TraceEvent
@@ -55,6 +56,7 @@ CREATE TABLE IF NOT EXISTS events (
     phase     TEXT NOT NULL,
     message   TEXT NOT NULL,
     data_json TEXT NOT NULL,
+    ts        TEXT,                     -- wall-clock when appended (observational; nullable for pre-v0.8 rows)
     PRIMARY KEY (run_id, seq)
 );
 CREATE TABLE IF NOT EXISTS step_outputs (
@@ -95,6 +97,18 @@ class RunStore:
         # busy_timeout lets a claim wait for the lock instead of erroring.
         self._conn.execute("PRAGMA busy_timeout = 5000")
         self._conn.executescript(_SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Bring an older on-disk store up to the current schema. `events.ts`
+        (v0.8) is added to stores created before it existed; old rows keep a
+        NULL ts and are simply excluded from latency metrics."""
+        cols = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(events)").fetchall()
+        }
+        if "ts" not in cols:
+            self._conn.execute("ALTER TABLE events ADD COLUMN ts TEXT")
 
     def close(self) -> None:
         self._conn.close()
@@ -210,8 +224,9 @@ class RunStore:
             (run_id,),
         ).fetchone()
         self._conn.execute(
-            "INSERT INTO events (run_id, seq, phase, message, data_json) VALUES (?, ?, ?, ?, ?)",
-            (run_id, row["next"], event.phase, event.message, json.dumps(event.data)),
+            "INSERT INTO events (run_id, seq, phase, message, data_json, ts) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (run_id, row["next"], event.phase, event.message, json.dumps(event.data), _now()),
         )
 
     def load_events(self, run_id: str) -> Trace:
@@ -238,6 +253,40 @@ class RunStore:
             "SELECT step_name, output FROM step_outputs WHERE run_id = ?", (run_id,)
         ).fetchall()
         return {r["step_name"]: r["output"] for r in rows}
+
+    # ----- metrics (a derived view of the persisted trace) -----
+
+    def _event_timestamps(self, run_id: str) -> List[Optional[str]]:
+        rows = self._conn.execute(
+            "SELECT ts FROM events WHERE run_id = ? ORDER BY seq", (run_id,)
+        ).fetchall()
+        return [r["ts"] for r in rows]
+
+    def run_metrics(self, run_id: str) -> Optional[RunMetrics]:
+        """Per-run metrics, computed by folding the run's persisted trace.
+        Returns None for an unknown run. Latency comes from the event
+        timestamp span; control-flow metrics from the event stream itself."""
+        record = self.get_run(run_id)
+        if record is None:
+            return None
+        duration = trace_span_ms(self._event_timestamps(run_id))
+        return compute_metrics(
+            self.load_events(run_id), status=record.status, duration_ms=duration
+        )
+
+    def aggregate_metrics(self) -> AggregateMetrics:
+        """Roll up every run's metrics into one monitoring view — success rate,
+        average latency, model/tool-call volume, per-program breakdown. This is
+        the dashboard's `/metrics` summary and the seed of any data-driven
+        iteration on a program."""
+        items: List[tuple] = []
+        for record in self.list_runs():
+            duration = trace_span_ms(self._event_timestamps(record.id))
+            metrics = compute_metrics(
+                self.load_events(record.id), status=record.status, duration_ms=duration
+            )
+            items.append((record.program_name, metrics))
+        return aggregate(items)
 
 
 class _WriteThroughTrace(List[TraceEvent]):

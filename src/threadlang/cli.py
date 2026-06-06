@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Dict, List
 
 from .llm import AnthropicClient, DryRunClient, LLMClient, LLMError, OpenAICompatClient
+from .metrics import compute_metrics
 from .parser import parse_program
 from .runtime import RuntimeError as TLRuntimeError, RuntimeResult, run_program
 from .store import RunStore, run_durable
@@ -71,6 +72,12 @@ def main() -> int:
         action="store_true",
         help="Print structured trace events to stderr after the output.",
     )
+    parser.add_argument(
+        "--metrics",
+        action="store_true",
+        help="Print run metrics (derived from the trace) as JSON to stderr "
+        "after the output. With --store, includes wall-clock latency.",
+    )
     args = parser.parse_args()
 
     if args.resume and not args.store:
@@ -124,6 +131,9 @@ def main() -> int:
             store.close()
             return 1
         result = durable.result
+        # Compute metrics before closing — the --store path can include
+        # wall-clock latency from the persisted event timestamps.
+        run_metrics = store.run_metrics(run_id) if args.metrics else None
         store.close()
     else:
         try:
@@ -131,11 +141,18 @@ def main() -> int:
         except (LLMError, TLRuntimeError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
+        run_metrics = (
+            compute_metrics(result.trace, status="completed") if args.metrics else None
+        )
     print(result.output)
 
     if args.trace:
         for event in result.trace:
             print(f"  [{event.phase}] {event.message}: {event.data}", file=sys.stderr)
+    if args.metrics and run_metrics is not None:
+        import json
+
+        print(json.dumps(run_metrics.to_dict(), indent=2), file=sys.stderr)
     return 0
 
 

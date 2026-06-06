@@ -32,7 +32,7 @@ from .tools import ToolRegistry
 class _Handler(BaseHTTPRequestHandler):
     # ThreadingHTTPServer gives each request its own thread; each opens its own
     # RunStore (sqlite connections are per-thread).
-    server_version = "threadlang/0.6"
+    server_version = "threadlang/0.8"
 
     def _store(self) -> RunStore:
         return RunStore(self.server.store_path)  # type: ignore[attr-defined]
@@ -61,7 +61,10 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             # ---- dashboard (HTML, read-only) ----
             if self.path in ("/", "/ui"):
-                self._send_html(200, render_run_list(store.list_runs()))
+                self._send_html(
+                    200,
+                    render_run_list(store.list_runs(), store.aggregate_metrics()),
+                )
                 return
             if self.path.startswith("/ui/runs/"):
                 run_id = self.path[len("/ui/runs/"):]
@@ -69,13 +72,29 @@ class _Handler(BaseHTTPRequestHandler):
                 if record is None:
                     self._send_html(404, f"<h1>404</h1><p>unknown run: {run_id}</p>")
                     return
-                self._send_html(200, render_run_detail(record, store.load_events(run_id)))
+                self._send_html(
+                    200,
+                    render_run_detail(
+                        record, store.load_events(run_id), store.run_metrics(run_id)
+                    ),
+                )
                 return
             # ---- JSON API ----
             if self.path == "/healthz":
                 self._send(200, {"ok": True})
+            elif self.path == "/metrics":
+                # Aggregate monitoring view: success rate, latency, call volume,
+                # per-program breakdown — all derived from the persisted traces.
+                self._send(200, store.aggregate_metrics().to_dict())
             elif self.path == "/runs":
                 self._send(200, {"runs": [_run_summary(r) for r in store.list_runs()]})
+            elif self.path.startswith("/runs/") and self.path.endswith("/metrics"):
+                run_id = self.path[len("/runs/"):-len("/metrics")]
+                metrics = store.run_metrics(run_id)
+                if metrics is None:
+                    self._send(404, {"error": f"unknown run_id: {run_id}"})
+                    return
+                self._send(200, {"run_id": run_id, "metrics": metrics.to_dict()})
             elif self.path.startswith("/runs/"):
                 run_id = self.path[len("/runs/"):]
                 record = store.get_run(run_id)

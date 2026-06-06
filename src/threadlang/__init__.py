@@ -12,6 +12,13 @@ from .llm import (
 )
 from .control import WorkerPool, process_one
 from .dashboard import render_run_detail, render_run_list
+from .metrics import (
+    AggregateMetrics,
+    RunMetrics,
+    aggregate,
+    compute_metrics,
+    trace_span_ms,
+)
 from .parser import ParseError, parse_program
 from .runtime import RuntimeError, RuntimeResult, run_program
 from .server import make_server, serve
@@ -34,6 +41,11 @@ __all__ = [
     "serve",
     "render_run_list",
     "render_run_detail",
+    "RunMetrics",
+    "AggregateMetrics",
+    "compute_metrics",
+    "aggregate",
+    "trace_span_ms",
     "LLMClient",
     "AgentLLMClient",
     "AnthropicClient",
