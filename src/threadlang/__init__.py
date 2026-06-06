@@ -7,6 +7,7 @@ from .llm import (
     DryRunClient,
     LLMClient,
     LLMError,
+    OpenAICompatClient,
     ToolCall,
 )
 from .parser import ParseError, parse_program
@@ -22,6 +23,7 @@ __all__ = [
     "LLMClient",
     "AgentLLMClient",
     "AnthropicClient",
+    "OpenAICompatClient",
     "DryRunClient",
     "LLMError",
     "AgentTurn",

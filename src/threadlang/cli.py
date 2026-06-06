@@ -6,9 +6,9 @@ import argparse
 from pathlib import Path
 from typing import Dict, List
 
-from .llm import AnthropicClient, DryRunClient, LLMClient, LLMError
+from .llm import AnthropicClient, DryRunClient, LLMClient, LLMError, OpenAICompatClient
 from .parser import parse_program
-from .runtime import run_program
+from .runtime import RuntimeError as TLRuntimeError, run_program
 
 
 def _parse_inputs(input_flags: List[str]) -> Dict[str, str]:
@@ -31,10 +31,25 @@ def main() -> int:
         help="Input value in key=value form (repeatable)",
     )
     parser.add_argument(
+        "--backend",
+        choices=["dry-run", "anthropic", "openai"],
+        default="anthropic",
+        help="Which LLM backend to use. 'dry-run' is the deterministic echo "
+        "client (no key). 'anthropic' calls Claude (ANTHROPIC_API_KEY). 'openai' "
+        "calls any OpenAI-compatible endpoint — hosted DeepSeek by default, or a "
+        "local Ollama via THREADLANG_BASE_URL (THREADLANG_API_KEY optional).",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Use the deterministic echo client instead of calling a real LLM. "
+        help="Shorthand for --backend dry-run: the deterministic echo client. "
         "Lets you run a program with steps / emit llm without an API key.",
+    )
+    parser.add_argument(
+        "--base-url",
+        default=None,
+        help="Override the OpenAI-compatible endpoint for --backend openai "
+        "(e.g. http://100.76.118.28:11434/v1 for a local Ollama).",
     )
     parser.add_argument(
         "--trace",
@@ -46,9 +61,13 @@ def main() -> int:
     source_text = args.source.read_text(encoding="utf-8")
     program = parse_program(source_text)
 
+    backend = "dry-run" if args.dry_run else args.backend
+
     client: LLMClient
-    if args.dry_run:
+    if backend == "dry-run":
         client = DryRunClient()
+    elif backend == "openai":
+        client = OpenAICompatClient(base_url=args.base_url)
     else:
         try:
             client = AnthropicClient()
@@ -63,12 +82,16 @@ def main() -> int:
                     flush=True,
                 )
 
-    result = run_program(program, inputs=_parse_inputs(args.input), llm_client=client)
+    import sys
+
+    try:
+        result = run_program(program, inputs=_parse_inputs(args.input), llm_client=client)
+    except (LLMError, TLRuntimeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     print(result.output)
 
     if args.trace:
-        import sys
-
         for event in result.trace:
             print(f"  [{event.phase}] {event.message}: {event.data}", file=sys.stderr)
     return 0

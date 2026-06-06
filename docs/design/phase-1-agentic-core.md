@@ -48,8 +48,11 @@ New modules / types:
   runtime contract), `ToolRegistry` (the allow-list), `default_registry()`
   (deterministic `echo` + `calculator`).
 - `llm.py` — the `AgentLLMClient` protocol (`agent_step`), normalized
-  `Message`/`ToolCall`/`AgentTurn` types, and implementations on both
-  `DryRunClient` (deterministic) and `AnthropicClient` (real tool-use).
+  `Message`/`ToolCall`/`AgentTurn` types, and three backends:
+  `DryRunClient` (deterministic), `OpenAICompatClient` (any OpenAI-compatible
+  `/v1` endpoint — DeepSeek/Ollama/vLLM — over stdlib HTTP, the low-cost/open
+  path), and `AnthropicClient` (premium). Per-step model names are the
+  cost-routing lever.
 - `ast.py` — `AgentStep` node alongside `Step`.
 - `runtime.py` — `_run_agent_step` (the loop), dispatched by node type.
 
@@ -106,12 +109,22 @@ durability + control-plane layers, added when a use case earns them.
 
 ## Verification
 
-- Existing suite: 10/10 pass (back-compat — no v0/v1 behavior changed).
+- Suite: 23/23 pass (10 back-compat + 13 agent/tool-boundary golden tests).
 - `examples/agent.thread` runs end-to-end under `--dry-run --trace`, emitting
   the full loop: agent turn → tool call → tool result → final answer.
-- Checked directly: `calculator` computes and rejects injection; mixed
-  `agent`/`llm` steps preserve declaration order; a scripted client confirms a
-  tool result (`42`) feeds back into the next turn and into the output.
+- Checked directly: `calculator` computes and rejects injection (incl. the
+  `**` DoS and `__import__` code-exec); mixed `agent`/`llm` steps preserve
+  declaration order; a scripted client confirms a tool result (`42`) feeds back
+  into the next turn and into the output.
+- **Live, real backend:** `OpenAICompatClient` verified against a running
+  Ollama `/v1` (`qwen2.5-coder:14b`) — `complete` returns real model output and
+  the full `agent_step` HTTP path (request build, optional-auth, OpenAI message
+  translation, response parsing, runtime loop) runs end-to-end. Finding worth
+  recording: that model/server emits the tool call as text with
+  `tool_calls: null` rather than native function-calling, so the client
+  correctly finalizes — native `agent` tool-calling needs DeepSeek or Claude;
+  local open models are best for `llm`/`complete` steps. The plumbing is
+  provider-agnostic; the capability is model-dependent.
 
 ## Next (L3 — durability)
 

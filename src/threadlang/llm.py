@@ -15,7 +15,10 @@ implement both protocols.
 
 from __future__ import annotations
 
+import json
 import os
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from typing import Dict, List, Mapping, Protocol, Sequence
 
@@ -218,6 +221,164 @@ def _to_anthropic_messages(messages: Sequence[Message]) -> List[Dict[str, object
                             "content": message.get("content", ""),
                         }
                     ],
+                }
+            )
+    return out
+
+
+DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
+
+
+class OpenAICompatClient:
+    """Any OpenAI-compatible `/v1/chat/completions` endpoint — DeepSeek, a
+    local Ollama server, vLLM, Together, etc. — over plain stdlib HTTP, so it
+    adds no dependency.
+
+    This is the low-cost / open-weight path. Two ways to point it:
+
+    - Hosted DeepSeek (default): set `THREADLANG_API_KEY` (or pass `api_key`);
+      `base_url` defaults to DeepSeek. Models: `deepseek-chat`, `deepseek-reasoner`.
+    - Free local Ollama: `base_url="http://<host>:11434/v1"`, no key needed.
+      Models: whatever is pulled, e.g. `qwen2.5-coder:14b`.
+
+    Both `complete` (plain `llm` steps) and `agent_step` (tool-use loop) are
+    implemented; tool-calling uses the OpenAI `tools` / `tool_calls` shape,
+    which DeepSeek and recent Ollama models support.
+    """
+
+    def __init__(
+        self,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        max_tokens: int = 1024,
+        timeout: float = 120.0,
+    ) -> None:
+        self._base_url = (
+            base_url or os.environ.get("THREADLANG_BASE_URL") or DEEPSEEK_BASE_URL
+        ).rstrip("/")
+        # A key is optional: local servers (Ollama) ignore it. Hosted providers
+        # 401 without one, which surfaces as a clear LLMError at call time.
+        self._api_key = (
+            api_key
+            or os.environ.get("THREADLANG_API_KEY")
+            or os.environ.get("OPENAI_API_KEY")
+        )
+        self._max_tokens = max_tokens
+        self._timeout = timeout
+
+    def _post(self, payload: Dict[str, object]) -> Dict[str, object]:
+        data = json.dumps(payload).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        request = urllib.request.Request(
+            f"{self._base_url}/chat/completions", data=data, headers=headers, method="POST"
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self._timeout) as resp:
+                body = resp.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:500]
+            raise LLMError(f"HTTP {exc.code} from {self._base_url}: {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise LLMError(f"could not reach {self._base_url}: {exc.reason}") from exc
+        try:
+            return json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise LLMError(f"non-JSON response from {self._base_url}: {body[:300]}") from exc
+
+    def complete(self, model: str, prompt: str) -> str:
+        resp = self._post(
+            {
+                "model": model,
+                "max_tokens": self._max_tokens,
+                "messages": [{"role": "user", "content": prompt}],
+            }
+        )
+        return _openai_message(resp).get("content") or ""
+
+    def agent_step(
+        self, model: str, messages: Sequence[Message], tools: Sequence[ToolSpec]
+    ) -> AgentTurn:
+        payload: Dict[str, object] = {
+            "model": model,
+            "max_tokens": self._max_tokens,
+            "messages": _to_openai_messages(messages),
+        }
+        if tools:
+            payload["tools"] = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.parameters,
+                    },
+                }
+                for t in tools
+            ]
+        message = _openai_message(self._post(payload))
+        text = message.get("content") or ""
+        calls: List[ToolCall] = []
+        for raw in message.get("tool_calls") or ():
+            fn = raw.get("function", {}) if isinstance(raw, Mapping) else {}
+            raw_args = fn.get("arguments", "{}")
+            try:
+                arguments = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args)
+            except (json.JSONDecodeError, TypeError):
+                arguments = {}
+            calls.append(
+                ToolCall(
+                    id=str(raw.get("id") or f"call_{len(calls)}"),
+                    name=str(fn.get("name", "")),
+                    arguments=arguments if isinstance(arguments, dict) else {},
+                )
+            )
+        return AgentTurn(text=str(text), tool_calls=tuple(calls))
+
+
+def _openai_message(resp: Mapping[str, object]) -> Dict[str, object]:
+    """Pull `choices[0].message` from a chat-completions response, defensively."""
+    choices = resp.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise LLMError(f"no choices in response: {json.dumps(resp)[:300]}")
+    message = choices[0].get("message") if isinstance(choices[0], Mapping) else None
+    if not isinstance(message, Mapping):
+        raise LLMError("malformed choice: no message object")
+    return dict(message)
+
+
+def _to_openai_messages(messages: Sequence[Message]) -> List[Dict[str, object]]:
+    """Translate the runtime's normalized messages into OpenAI chat format.
+    Assistant tool calls become a `tool_calls` array (arguments JSON-encoded);
+    tool results become `role: tool` messages keyed by `tool_call_id`."""
+    out: List[Dict[str, object]] = []
+    for message in messages:
+        role = message.get("role")
+        if role == "user":
+            out.append({"role": "user", "content": message.get("content", "")})
+        elif role == "assistant":
+            entry: Dict[str, object] = {"role": "assistant", "content": message.get("text") or ""}
+            tool_calls = message.get("tool_calls") or ()
+            if tool_calls:
+                entry["tool_calls"] = [
+                    {
+                        "id": call.id,
+                        "type": "function",
+                        "function": {
+                            "name": call.name,
+                            "arguments": json.dumps(call.arguments),
+                        },
+                    }
+                    for call in tool_calls  # type: ignore[union-attr]
+                ]
+            out.append(entry)
+        elif role == "tool":
+            out.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": message.get("tool_call_id"),
+                    "content": message.get("content", ""),
                 }
             )
     return out

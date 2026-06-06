@@ -39,8 +39,9 @@ thread TwoStep {
 ## Install
 
 ```bash
-pip install threadlang                   # core only
-pip install 'threadlang[anthropic]'      # + AnthropicClient (real Claude calls)
+pip install threadlang                   # core only — includes the OpenAI-compatible
+                                         #   backend (DeepSeek / Ollama / vLLM …), zero deps
+pip install 'threadlang[anthropic]'      # + AnthropicClient (premium Claude calls)
 ```
 
 ## Run
@@ -62,6 +63,41 @@ threadlang examples/two_step.thread --input text="..." --dry-run --trace
 # v0.3 agent step — runs a tool-use loop (dry-run needs no API key)
 threadlang examples/agent.thread --input task="what is 21*2?" --dry-run --trace
 ```
+
+## Backends
+
+The model is the only non-deterministic part of a run; everything around it is
+deterministic and traced. Pick the backend with `--backend` — the cheap/open
+path is first-class, not an afterthought:
+
+```bash
+# Open / low-cost (default for agent examples): any OpenAI-compatible endpoint.
+# Hosted DeepSeek — reliable native tool-calling, a few cents per run:
+export THREADLANG_API_KEY=sk-...      # DeepSeek key
+threadlang examples/agent.thread --input task="what is 21*2?" --backend openai
+
+# Free local Ollama (no key, runs on your own GPU) — great for llm/complete steps:
+threadlang examples/summarize.thread --input text="..." \
+  --backend openai --base-url http://<host>:11434/v1
+#   (set the model name in the .thread file to a pulled model, e.g. qwen2.5-coder:14b)
+
+# Premium — Anthropic Claude:
+export ANTHROPIC_API_KEY=sk-ant-...
+threadlang examples/agent.thread --input task="what is 21*2?" --backend anthropic
+```
+
+| Backend | Flag | Auth | `llm` steps | `agent` tool-calls |
+|---|---|---|---|---|
+| Dry-run (echo) | `--dry-run` | none | deterministic stub | deterministic stub |
+| OpenAI-compatible | `--backend openai` | `THREADLANG_API_KEY` (optional for local) | ✓ | ✓ when the model emits native `tool_calls` |
+| Anthropic | `--backend anthropic` | `ANTHROPIC_API_KEY` | ✓ | ✓ |
+
+`--backend openai` talks to any `/v1/chat/completions` server (DeepSeek, Ollama,
+vLLM, Together, …) over stdlib HTTP — no SDK. Tool-calling rides the OpenAI
+`tools`/`tool_calls` shape; DeepSeek supports it natively. Some local models
+(e.g. `qwen2.5-coder:14b` via Ollama's `/v1`) describe the call as text instead
+of emitting native `tool_calls` — use them for `llm`/`complete` steps, and
+DeepSeek (or Claude) for `agent` steps.
 
 ## Agentic steps (v0.3)
 
@@ -120,8 +156,9 @@ behind the platform layers below rather than bolted on early.
 
 ## Project shape
 
-- Zero runtime dependencies. `anthropic` is an *optional* extra; the
-  `DryRunClient` lets you run any program — agent steps included — without it.
+- Zero runtime dependencies. The OpenAI-compatible backend (DeepSeek / Ollama /
+  vLLM …) ships in core over stdlib HTTP; `anthropic` is an *optional* extra; the
+  `DryRunClient` lets you run any program — agent steps included — without either.
 - Frozen dataclass AST nodes (`src/threadlang/ast.py`); `Step` (llm) and
   `AgentStep` are distinct node types.
 - Parser (`src/threadlang/parser.py`) — regex for the flat blocks, plus a
@@ -133,7 +170,9 @@ behind the platform layers below rather than bolted on early.
   call, and tool result appends a `TraceEvent`.
 - LLM-client protocols (`src/threadlang/llm.py`) — `complete(model, prompt)`
   for `llm` steps, `agent_step(model, messages, tools)` for `agent` steps.
-  Implement either to plug in any backend (OpenAI, Ollama, etc.).
+  Backends: `OpenAICompatClient` (DeepSeek / Ollama / any `/v1`), `AnthropicClient`,
+  `DryRunClient`. Per-step model names are the cost-routing lever — cheap open
+  model for easy steps, a strong model only where it earns it.
 - Tools (`src/threadlang/tools.py`) — `ToolRegistry` allow-list +
   `FunctionTool` wrapper + deterministic built-ins.
 

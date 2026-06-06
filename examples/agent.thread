@@ -5,7 +5,7 @@ thread Researcher {
 
   steps {
     step solve {
-      agent "claude-haiku-4-5-20251001" {
+      agent "deepseek-chat" {
         tools [ echo, calculator ]
         max_iters 4
         "You are " + context.persona + ". Use a tool if it helps. Task: " + inputs.task
