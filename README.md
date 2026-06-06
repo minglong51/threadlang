@@ -12,8 +12,9 @@ just a single prompt (see [Agentic steps](#agentic-steps-v03)). As of **v0.4** a
 run can be **durable**: its trace persists to sqlite as an event log, and a run
 that crashes [resumes from the last completed step](#durability-v04). As of
 **v0.5** there is a [**control plane**](#control-plane-v05): an HTTP API + worker
-pool that drains a durable run queue. Build plans:
-[`docs/design/`](docs/design/).
+pool that drains a durable run queue. As of **v0.6** the same server hosts a
+read-only [**observability dashboard**](#observability-v06) — a run list and a
+per-run trace timeline. Build plans: [`docs/design/`](docs/design/).
 
 ```thread
 thread TwoStep {
@@ -194,6 +195,32 @@ Built from `process_one` (claim + run one queued run) and a `WorkerPool` of
 threads; the claim is atomic so no run executes twice. Details:
 [`docs/design/phase-3-control-plane.md`](docs/design/phase-3-control-plane.md).
 
+## Observability (v0.6)
+
+The control-plane server also hosts a read-only dashboard over the persisted
+trace — no extra process, no build step, no JavaScript. The trace has been the
+durable record since v0.1; this is the layer that lets a human read it.
+
+```bash
+threadlang-serve --store runs.db --port 8765 --workers 2 --backend openai
+# then open:
+#   http://localhost:8765/            run list (status + output, links to each run)
+#   http://localhost:8765/ui/runs/ab12…   one run: status, inputs, output, trace timeline
+```
+
+| Path | Renders |
+|---|---|
+| `GET /` (or `/ui`) | run list — every run, status badge, links to detail |
+| `GET /ui/runs/{id}` | one run: status, inputs, output/error, and the `TraceEvent` timeline |
+
+The detail page renders the full event stream — context bindings, step calls,
+agent turns, tool calls, tool results — as a phase-colored timeline, so an agent
+run reconstructs visually from exactly the data L3 persists. A run still
+`pending`/`running` auto-refreshes so its timeline updates live; a settled run
+is static. All model output and trace data is `html.escape`d before rendering —
+untrusted text never reaches the page raw. Details:
+[`docs/design/phase-4-observability.md`](docs/design/phase-4-observability.md).
+
 ## Language
 
 ```
@@ -250,6 +277,10 @@ behind the platform layers below rather than bolted on early.
 - Control plane (`src/threadlang/control.py`, `server.py`) — `process_one` +
   `WorkerPool` drain the store's `pending` runs; a stdlib `http.server` JSON API
   enqueues and reports them. The queue is the store; no extra broker.
+- Observability (`src/threadlang/dashboard.py`) — pure `(record, events) -> HTML`
+  render functions for a read-only run list + per-run trace timeline, served by
+  the same `http.server` on `/` and `/ui/runs/{id}`. Server-rendered, inline CSS,
+  zero JS; all untrusted text is `html.escape`d.
 
 ## Roadmap — the platform layers
 
@@ -261,7 +292,8 @@ The remaining layers each keep the determinism/trace bet:
    event log, so runs checkpoint and resume from failure.
 3. **Control plane** *(v0.5, shipped)* — an API + worker pool draining a
    durable run queue.
-4. **Observability** — a read-only trace-timeline dashboard.
+4. **Observability** *(v0.6, shipped)* — a read-only run list + per-run
+   trace-timeline dashboard, served by the same control-plane process.
 5. **Vertical-slice app** — one concrete multi-agent product proving it end to end.
 
 ## License

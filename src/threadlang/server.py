@@ -22,6 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
 from .control import WorkerPool
+from .dashboard import render_run_detail, render_run_list
 from .llm import LLMClient
 from .parser import ParseError, parse_program
 from .store import RunStore
@@ -30,7 +31,7 @@ from .store import RunStore
 class _Handler(BaseHTTPRequestHandler):
     # ThreadingHTTPServer gives each request its own thread; each opens its own
     # RunStore (sqlite connections are per-thread).
-    server_version = "threadlang/0.5"
+    server_version = "threadlang/0.6"
 
     def _store(self) -> RunStore:
         return RunStore(self.server.store_path)  # type: ignore[attr-defined]
@@ -43,12 +44,33 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_html(self, code: int, html_text: str) -> None:
+        body = html_text.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def log_message(self, *args) -> None:  # quiet by default
         pass
 
     def do_GET(self) -> None:
         store = self._store()
         try:
+            # ---- dashboard (HTML, read-only) ----
+            if self.path in ("/", "/ui"):
+                self._send_html(200, render_run_list(store.list_runs()))
+                return
+            if self.path.startswith("/ui/runs/"):
+                run_id = self.path[len("/ui/runs/"):]
+                record = store.get_run(run_id)
+                if record is None:
+                    self._send_html(404, f"<h1>404</h1><p>unknown run: {run_id}</p>")
+                    return
+                self._send_html(200, render_run_detail(record, store.load_events(run_id)))
+                return
+            # ---- JSON API ----
             if self.path == "/healthz":
                 self._send(200, {"ok": True})
             elif self.path == "/runs":
@@ -134,7 +156,9 @@ def serve(
     pool.start()
     httpd = make_server(store_path, host, port)
     print(f"threadlang control plane on http://{host}:{port}  "
-          f"(store={store_path}, workers={n_workers})", flush=True)
+          f"(store={store_path}, workers={n_workers})\n"
+          f"  dashboard: http://{host}:{port}/    ·    API: POST http://{host}:{port}/runs",
+          flush=True)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

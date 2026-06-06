@@ -11,6 +11,7 @@ from .llm import (
     ToolCall,
 )
 from .control import WorkerPool, process_one
+from .dashboard import render_run_detail, render_run_list
 from .parser import ParseError, parse_program
 from .runtime import RuntimeError, RuntimeResult, run_program
 from .server import make_server, serve
@@ -31,6 +32,8 @@ __all__ = [
     "process_one",
     "make_server",
     "serve",
+    "render_run_list",
+    "render_run_detail",
     "LLMClient",
     "AgentLLMClient",
     "AnthropicClient",
