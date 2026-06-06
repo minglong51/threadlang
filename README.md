@@ -14,7 +14,10 @@ that crashes [resumes from the last completed step](#durability-v04). As of
 **v0.5** there is a [**control plane**](#control-plane-v05): an HTTP API + worker
 pool that drains a durable run queue. As of **v0.6** the same server hosts a
 read-only [**observability dashboard**](#observability-v06) — a run list and a
-per-run trace timeline. Build plans: [`docs/design/`](docs/design/).
+per-run trace timeline. As of **v0.7** there is a first product on the stack: a
+[**support-triage app**](#vertical-slice-support-triage-v07) that classifies a
+ticket, searches a knowledge base, and drafts a reply — durable, queued, and
+inspectable like any other run. Build plans: [`docs/design/`](docs/design/).
 
 ```thread
 thread TwoStep {
@@ -221,6 +224,38 @@ is static. All model output and trace data is `html.escape`d before rendering �
 untrusted text never reaches the page raw. Details:
 [`docs/design/phase-4-observability.md`](docs/design/phase-4-observability.md).
 
+## Vertical slice: support-triage (v0.7)
+
+The first product *on* the stack — proof the layers compose into something a
+user runs. Given a support ticket it runs a two-step program: an `agent` step
+classifies priority and searches a knowledge base using the app's **own tools**,
+then an `llm` step drafts a customer reply. It is an ordinary durable run, so it
+checkpoints, enqueues over the API, and renders on the dashboard with no
+app-specific support.
+
+```bash
+# one ticket, durably, in-process — deterministic, no key
+support-triage run --ticket "The dashboard is down with 500s, urgent" --dry-run
+
+# real model (DeepSeek native tool-calling, or local Ollama)
+support-triage run --ticket "..." --backend openai
+
+# or serve the API + workers + dashboard with the app's tool registry wired in
+support-triage serve --store runs.db --backend openai
+#   POST /runs {"source": <triage.thread>, "inputs": {"ticket": "..."}}
+```
+
+The app lives in `src/threadlang/apps/support_triage/` and adds **no core
+machinery** — a program (`triage.thread`), a tool registry (`build_registry()`
+extends the built-ins with `classify_priority` + `search_kb`), and a thin
+entrypoint. The one core change is `serve(tools=...)`, so any app can serve its
+own programs over the same API. `classify_priority` is deterministic keyword
+rules (no model call — cheap, inspectable); the model is spent only on the
+draft. Because the tools are pure and `DryRunClient` fires the first
+allow-listed tool, the whole product runs end-to-end under `--dry-run` and is
+golden-tested. Details:
+[`docs/design/phase-5-vertical-slice.md`](docs/design/phase-5-vertical-slice.md).
+
 ## Language
 
 ```
@@ -281,6 +316,10 @@ behind the platform layers below rather than bolted on early.
   render functions for a read-only run list + per-run trace timeline, served by
   the same `http.server` on `/` and `/ui/runs/{id}`. Server-rendered, inline CSS,
   zero JS; all untrusted text is `html.escape`d.
+- Vertical-slice app (`src/threadlang/apps/support_triage/`) — a product *on*
+  the stack: a triage program, an app-owned tool registry (`build_registry`
+  extends the built-ins), and a `support-triage` entrypoint. Adds no core
+  machinery; runs as an ordinary durable/queued/observable run.
 
 ## Roadmap — the platform layers
 
@@ -294,7 +333,9 @@ The remaining layers each keep the determinism/trace bet:
    durable run queue.
 4. **Observability** *(v0.6, shipped)* — a read-only run list + per-run
    trace-timeline dashboard, served by the same control-plane process.
-5. **Vertical-slice app** — one concrete multi-agent product proving it end to end.
+5. **Vertical-slice app** *(v0.7, shipped)* — a support-triage product on the
+   stack (agent classify + KB search → llm draft), proving the layers compose
+   end to end with no new core machinery.
 
 ## License
 

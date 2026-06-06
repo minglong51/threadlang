@@ -26,6 +26,7 @@ from .dashboard import render_run_detail, render_run_list
 from .llm import LLMClient
 from .parser import ParseError, parse_program
 from .store import RunStore
+from .tools import ToolRegistry
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -150,9 +151,15 @@ def serve(
     port: int = 8765,
     n_workers: int = 2,
     llm_client: Optional[LLMClient] = None,
+    tools: Optional[ToolRegistry] = None,
 ) -> None:
-    """Start the worker pool + HTTP API and block serving requests."""
-    pool = WorkerPool(store_path, n_workers=n_workers, llm_client=llm_client)
+    """Start the worker pool + HTTP API and block serving requests.
+
+    `tools` is the registry the workers' agent steps draw from; pass an app's
+    custom registry (e.g. the support-triage app's) to serve domain programs.
+    Defaults to the deterministic built-ins.
+    """
+    pool = WorkerPool(store_path, n_workers=n_workers, llm_client=llm_client, tools=tools)
     pool.start()
     httpd = make_server(store_path, host, port)
     print(f"threadlang control plane on http://{host}:{port}  "

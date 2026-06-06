@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "threadlang"
-version = "0.6.0"
+version = "0.7.0"
 description = "A small DSL for deterministic, traceable LLM and agent workflows"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -18,6 +18,10 @@ anthropic = ["anthropic>=0.40,<1.0"]
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"threadlang.apps.support_triage" = ["*.thread"]
+
 [project.scripts]
 threadlang = "threadlang.cli:main"
 threadlang-serve = "threadlang.server:main"
+support-triage = "threadlang.apps.support_triage.app:main"

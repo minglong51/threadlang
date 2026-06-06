@@ -1,0 +1,25 @@
+thread SupportTriage {
+  context {
+    tone = "a calm, concise, friendly support voice"
+  }
+
+  steps {
+    step investigate {
+      agent "deepseek-chat" {
+        tools [ classify_priority, search_kb ]
+        max_iters 5
+        "Triage this support ticket. First classify its priority, then search the knowledge base for the most relevant article(s). Report the priority and the article findings concisely. Ticket:\n" + inputs.ticket
+      }
+    }
+
+    step draft {
+      llm "deepseek-chat" {
+        "You are support with " + context.tone + ". Using these triage findings (priority and relevant KB articles):\n" + steps.investigate.output + "\n\nWrite a short reply to the customer that acknowledges the issue and gives the concrete next step from the article. Do not invent policy beyond the findings. Ticket:\n" + inputs.ticket
+      }
+    }
+  }
+
+  emit text {
+    steps.draft.output
+  }
+}
