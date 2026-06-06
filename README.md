@@ -10,8 +10,10 @@ what happened.
 As of **v0.3** a step can be an `agent`: a model that runs a tool-use loop, not
 just a single prompt (see [Agentic steps](#agentic-steps-v03)). As of **v0.4** a
 run can be **durable**: its trace persists to sqlite as an event log, and a run
-that crashes [resumes from the last completed step](#durability-v04). Build
-plans: [`docs/design/`](docs/design/).
+that crashes [resumes from the last completed step](#durability-v04). As of
+**v0.5** there is a [**control plane**](#control-plane-v05): an HTTP API + worker
+pool that drains a durable run queue. Build plans:
+[`docs/design/`](docs/design/).
 
 ```thread
 thread TwoStep {
@@ -161,6 +163,37 @@ finished steps are reused. Replaying a *completed* run returns the stored
 result and makes no model calls. Details:
 [`docs/design/phase-2-durability.md`](docs/design/phase-2-durability.md).
 
+## Control plane (v0.5)
+
+Submit runs over HTTP and let a worker pool execute them. The `pending` rows in
+the run store *are* the queue — no extra broker — so the queue survives a
+restart, and because workers run on the durable path, a worker that crashes
+mid-run is recovered by re-dispatching the same id.
+
+```bash
+# Start the API + workers (stdlib http.server; zero deps)
+threadlang-serve --store runs.db --port 8765 --workers 2 --backend openai
+
+# Enqueue a run → get an id back immediately
+curl -X POST localhost:8765/runs -H 'content-type: application/json' \
+  -d '{"source":"thread T { context{} steps{} emit text { inputs.x } }","inputs":{"x":"hi"}}'
+# → {"run_id": "ab12…", "status": "pending"}
+
+curl localhost:8765/runs/ab12…     # status + output + full persisted trace
+curl localhost:8765/runs           # list all runs
+```
+
+| Method / path | Does |
+|---|---|
+| `POST /runs` | enqueue `{source, inputs}` (program validated first) → `run_id` |
+| `GET /runs` | list runs (id, status, program, output) |
+| `GET /runs/{id}` | one run: status, output, error, and the persisted trace |
+| `GET /healthz` | liveness |
+
+Built from `process_one` (claim + run one queued run) and a `WorkerPool` of
+threads; the claim is atomic so no run executes twice. Details:
+[`docs/design/phase-3-control-plane.md`](docs/design/phase-3-control-plane.md).
+
 ## Language
 
 ```
@@ -214,6 +247,9 @@ behind the platform layers below rather than bolted on early.
 - Durable store (`src/threadlang/store.py`) — `RunStore` (stdlib sqlite) +
   `run_durable`; the trace becomes a persisted event log with step checkpoints
   and resume-from-failure. The runtime stays storage-agnostic.
+- Control plane (`src/threadlang/control.py`, `server.py`) — `process_one` +
+  `WorkerPool` drain the store's `pending` runs; a stdlib `http.server` JSON API
+  enqueues and reports them. The queue is the store; no extra broker.
 
 ## Roadmap — the platform layers
 
@@ -223,7 +259,8 @@ The remaining layers each keep the determinism/trace bet:
 1. **Agentic core** *(v0.3, shipped)* — tools + agent tool-use loop.
 2. **Durability** *(v0.4, shipped)* — sqlite run store; the trace becomes an
    event log, so runs checkpoint and resume from failure.
-3. **Control plane** — an API + worker pool draining a durable run queue.
+3. **Control plane** *(v0.5, shipped)* — an API + worker pool draining a
+   durable run queue.
 4. **Observability** — a read-only trace-timeline dashboard.
 5. **Vertical-slice app** — one concrete multi-agent product proving it end to end.
 

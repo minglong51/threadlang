@@ -10,8 +10,10 @@ from .llm import (
     OpenAICompatClient,
     ToolCall,
 )
+from .control import WorkerPool, process_one
 from .parser import ParseError, parse_program
 from .runtime import RuntimeError, RuntimeResult, run_program
+from .server import make_server, serve
 from .store import DurableRun, RunRecord, RunStore, run_durable
 from .tools import FunctionTool, Tool, ToolRegistry, ToolSpec, default_registry
 
@@ -25,6 +27,10 @@ __all__ = [
     "RunRecord",
     "DurableRun",
     "run_durable",
+    "WorkerPool",
+    "process_one",
+    "make_server",
+    "serve",
     "LLMClient",
     "AgentLLMClient",
     "AnthropicClient",

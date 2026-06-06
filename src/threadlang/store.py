@@ -41,8 +41,9 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
     id           TEXT PRIMARY KEY,
     program_name TEXT NOT NULL,
-    status       TEXT NOT NULL,            -- running | completed | failed
+    status       TEXT NOT NULL,            -- pending | running | completed | failed
     inputs_json  TEXT NOT NULL,
+    source       TEXT,                     -- program text, set when enqueued via the control plane
     output       TEXT,
     error        TEXT,
     created_at   TEXT NOT NULL,
@@ -77,6 +78,7 @@ class RunRecord:
     inputs: Dict[str, str]
     output: Optional[str]
     error: Optional[str]
+    source: Optional[str] = None
 
 
 class RunStore:
@@ -89,10 +91,25 @@ class RunStore:
         # which is the whole point of a crash-resumable store.
         self._conn = sqlite3.connect(path, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
+        # Workers run in separate threads/processes against the same file; a
+        # busy_timeout lets a claim wait for the lock instead of erroring.
+        self._conn.execute("PRAGMA busy_timeout = 5000")
         self._conn.executescript(_SCHEMA)
 
     def close(self) -> None:
         self._conn.close()
+
+    @staticmethod
+    def _row_to_record(row: sqlite3.Row) -> RunRecord:
+        return RunRecord(
+            id=row["id"],
+            program_name=row["program_name"],
+            status=row["status"],
+            inputs=json.loads(row["inputs_json"]),
+            output=row["output"],
+            error=row["error"],
+            source=row["source"],
+        )
 
     # ----- runs -----
 
@@ -108,33 +125,64 @@ class RunStore:
 
     def get_run(self, run_id: str) -> Optional[RunRecord]:
         row = self._conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
-        if row is None:
-            return None
-        return RunRecord(
-            id=row["id"],
-            program_name=row["program_name"],
-            status=row["status"],
-            inputs=json.loads(row["inputs_json"]),
-            output=row["output"],
-            error=row["error"],
-        )
+        return self._row_to_record(row) if row is not None else None
 
     def list_runs(self) -> List[RunRecord]:
         """All runs, newest first — the basis for a run list / dashboard."""
         rows = self._conn.execute(
             "SELECT * FROM runs ORDER BY created_at DESC, id DESC"
         ).fetchall()
-        return [
-            RunRecord(
-                id=r["id"],
-                program_name=r["program_name"],
-                status=r["status"],
-                inputs=json.loads(r["inputs_json"]),
-                output=r["output"],
-                error=r["error"],
+        return [self._row_to_record(r) for r in rows]
+
+    # ----- control-plane queue: pending runs ARE the queue -----
+
+    def enqueue_run(
+        self, program_name: str, source: str, inputs: Dict[str, str]
+    ) -> str:
+        """Create a run in `pending` state without executing it. A worker
+        claims and runs it later. The program `source` is stored so any worker
+        can reconstruct the program."""
+        run_id = uuid.uuid4().hex
+        now = _now()
+        self._conn.execute(
+            "INSERT INTO runs (id, program_name, status, inputs_json, source, created_at, updated_at) "
+            "VALUES (?, ?, 'pending', ?, ?, ?, ?)",
+            (run_id, program_name, json.dumps(dict(inputs)), source, now, now),
+        )
+        return run_id
+
+    def claim_next_pending(self) -> Optional[RunRecord]:
+        """Atomically take the oldest `pending` run and mark it `running`,
+        returning it (with `source`). Returns None if the queue is empty. The
+        `BEGIN IMMEDIATE` write-lock serializes claims across worker
+        connections, so no run is ever claimed twice."""
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT * FROM runs WHERE status = 'pending' ORDER BY created_at, id LIMIT 1"
+            ).fetchone()
+            if row is None:
+                conn.execute("COMMIT")
+                return None
+            conn.execute(
+                "UPDATE runs SET status = 'running', updated_at = ? WHERE id = ?",
+                (_now(), row["id"]),
             )
-            for r in rows
-        ]
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        record = self._row_to_record(row)
+        return RunRecord(
+            id=record.id,
+            program_name=record.program_name,
+            status="running",
+            inputs=record.inputs,
+            output=record.output,
+            error=record.error,
+            source=record.source,
+        )
 
     def mark_running(self, run_id: str) -> None:
         self._conn.execute(
