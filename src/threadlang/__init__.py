@@ -12,6 +12,7 @@ from .llm import (
 )
 from .parser import ParseError, parse_program
 from .runtime import RuntimeError, RuntimeResult, run_program
+from .store import DurableRun, RunRecord, RunStore, run_durable
 from .tools import FunctionTool, Tool, ToolRegistry, ToolSpec, default_registry
 
 __all__ = [
@@ -20,6 +21,10 @@ __all__ = [
     "run_program",
     "RuntimeError",
     "RuntimeResult",
+    "RunStore",
+    "RunRecord",
+    "DurableRun",
+    "run_durable",
     "LLMClient",
     "AgentLLMClient",
     "AnthropicClient",

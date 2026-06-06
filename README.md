@@ -8,8 +8,10 @@ result) appends a structured `TraceEvent`. The trace is the durable record of
 what happened.
 
 As of **v0.3** a step can be an `agent`: a model that runs a tool-use loop, not
-just a single prompt. See [Agentic steps](#agentic-steps-v03) and the build
-plan in [`docs/design/phase-1-agentic-core.md`](docs/design/phase-1-agentic-core.md).
+just a single prompt (see [Agentic steps](#agentic-steps-v03)). As of **v0.4** a
+run can be **durable**: its trace persists to sqlite as an event log, and a run
+that crashes [resumes from the last completed step](#durability-v04). Build
+plans: [`docs/design/`](docs/design/).
 
 ```thread
 thread TwoStep {
@@ -125,6 +127,40 @@ step solve {
 - Every model turn, tool call, and tool result is a `TraceEvent` — the entire
   agent run reconstructs from the trace.
 
+## Durability (v0.4)
+
+A run can persist to a sqlite store: its `TraceEvent` stream becomes a durable
+event log, each completed step is checkpointed, and the run carries an id +
+status. If it crashes, resume it from the last completed step — no re-running
+finished work.
+
+```bash
+# Persist a run; prints run_id and (on failure) the resume command
+threadlang examples/two_step.thread --input text="..." --backend openai --store runs.db
+
+# A crash prints:  run failed; resume with: --store runs.db --resume <id>
+threadlang examples/two_step.thread --input text="..." --backend openai \
+  --store runs.db --resume <id>          # skips completed steps, continues
+```
+
+```python
+from threadlang import parse_program, run_durable, RunStore
+
+store = RunStore("runs.db")
+durable = run_durable(parse_program(src), {"text": "..."}, store)
+durable.run_id              # the run's id
+store.get_run(durable.run_id).status        # 'completed' | 'failed' | 'running'
+store.load_events(durable.run_id)           # the persisted trace
+store.list_runs()                           # all runs (for a dashboard)
+```
+
+The runtime stays storage-agnostic — `run_durable` hands it a write-through
+trace and a checkpoint callback, so the same executor runs durable or
+ephemeral. Checkpoints are step-level; a crash mid-step re-runs that step,
+finished steps are reused. Replaying a *completed* run returns the stored
+result and makes no model calls. Details:
+[`docs/design/phase-2-durability.md`](docs/design/phase-2-durability.md).
+
 ## Language
 
 ```
@@ -175,6 +211,9 @@ behind the platform layers below rather than bolted on early.
   model for easy steps, a strong model only where it earns it.
 - Tools (`src/threadlang/tools.py`) — `ToolRegistry` allow-list +
   `FunctionTool` wrapper + deterministic built-ins.
+- Durable store (`src/threadlang/store.py`) — `RunStore` (stdlib sqlite) +
+  `run_durable`; the trace becomes a persisted event log with step checkpoints
+  and resume-from-failure. The runtime stays storage-agnostic.
 
 ## Roadmap — the platform layers
 
@@ -182,8 +221,8 @@ ThreadLang is the authoring + execution core of a production agent platform.
 The remaining layers each keep the determinism/trace bet:
 
 1. **Agentic core** *(v0.3, shipped)* — tools + agent tool-use loop.
-2. **Durability** — sqlite run store; the trace becomes an event log, so runs
-   checkpoint and resume from failure.
+2. **Durability** *(v0.4, shipped)* — sqlite run store; the trace becomes an
+   event log, so runs checkpoint and resume from failure.
 3. **Control plane** — an API + worker pool draining a durable run queue.
 4. **Observability** — a read-only trace-timeline dashboard.
 5. **Vertical-slice app** — one concrete multi-agent product proving it end to end.

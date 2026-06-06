@@ -19,7 +19,7 @@ itself is stateless across runs.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Mapping, Optional
+from typing import Callable, Dict, Mapping, Optional
 
 from .ast import (
     AgentStep,
@@ -53,6 +53,10 @@ def run_program(
     inputs: Mapping[str, str],
     llm_client: Optional[LLMClient] = None,
     tools: Optional[ToolRegistry] = None,
+    *,
+    trace: Optional[Trace] = None,
+    resume_outputs: Optional[Mapping[str, str]] = None,
+    on_step_complete: Optional[Callable[[str, str], None]] = None,
 ) -> RuntimeResult:
     """Execute a ThreadLang program.
 
@@ -63,13 +67,25 @@ def run_program(
 
     `tools` is the registry an `agent` step draws from; if omitted, the
     deterministic built-ins (`default_registry()`) are used.
+
+    Durability hooks (used by `store.run_durable`, ignored otherwise; the
+    runtime stays storage-agnostic):
+
+    - `trace` — supply a Trace object to append into (e.g. a write-through
+      trace that persists each event). Defaults to a fresh list.
+    - `resume_outputs` — step outputs already completed in a prior attempt;
+      these steps are skipped and their stored output reused.
+    - `on_step_complete(name, output)` — called after each freshly-run step,
+      so a caller can checkpoint it.
     """
-    trace: Trace = []
+    trace = trace if trace is not None else []
     context = _build_context(program, trace)
 
     client = llm_client or DryRunClient()
     registry = tools or default_registry()
-    step_outputs = _run_steps(program, context, inputs, client, registry, trace)
+    step_outputs = _run_steps(
+        program, context, inputs, client, registry, trace, resume_outputs, on_step_complete
+    )
 
     output = _evaluate_emit(
         program.emit, context, inputs, step_outputs, client, trace
@@ -101,9 +117,24 @@ def _run_steps(
     client: LLMClient,
     registry: ToolRegistry,
     trace: Trace,
+    resume_outputs: Optional[Mapping[str, str]] = None,
+    on_step_complete: Optional[Callable[[str, str], None]] = None,
 ) -> Dict[str, str]:
     step_outputs: Dict[str, str] = {}
     for step in program.steps.steps:
+        if resume_outputs is not None and step.name in resume_outputs:
+            # This step finished in a prior attempt and was checkpointed; reuse
+            # its output instead of re-running it. The skip is itself traced.
+            output = resume_outputs[step.name]
+            trace.append(
+                TraceEvent(
+                    phase="step",
+                    message=f"Step '{step.name}' resumed from checkpoint",
+                    data={"step": step.name, "output": output, "resumed": True},
+                )
+            )
+            step_outputs[step.name] = output
+            continue
         if isinstance(step, AgentStep):
             output = _run_agent_step(
                 step, context, inputs, step_outputs, client, registry, trace
@@ -111,6 +142,8 @@ def _run_steps(
         else:
             output = _run_llm_step(step, context, inputs, step_outputs, client, trace)
         step_outputs[step.name] = output
+        if on_step_complete is not None:
+            on_step_complete(step.name, output)
     return step_outputs
 
 
