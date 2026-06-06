@@ -22,15 +22,18 @@ from dataclasses import dataclass
 from typing import Dict, Mapping, Optional
 
 from .ast import (
+    AgentStep,
     ContextRef,
     EmitBlock,
     Expression,
     InputsRef,
     Program,
+    Step,
     StepsRef,
     StringLiteral,
 )
-from .llm import DryRunClient, LLMClient
+from .llm import DryRunClient, LLMClient, Message
+from .tools import ToolRegistry, default_registry
 from .trace import Trace, TraceEvent
 
 
@@ -49,6 +52,7 @@ def run_program(
     program: Program,
     inputs: Mapping[str, str],
     llm_client: Optional[LLMClient] = None,
+    tools: Optional[ToolRegistry] = None,
 ) -> RuntimeResult:
     """Execute a ThreadLang program.
 
@@ -56,12 +60,16 @@ def run_program(
     `emit llm`. If omitted, a `DryRunClient` is used — fine for tests, but
     callers wiring a real workflow should pass an `AnthropicClient` (or
     any object satisfying the `LLMClient` protocol).
+
+    `tools` is the registry an `agent` step draws from; if omitted, the
+    deterministic built-ins (`default_registry()`) are used.
     """
     trace: Trace = []
     context = _build_context(program, trace)
 
     client = llm_client or DryRunClient()
-    step_outputs = _run_steps(program, context, inputs, client, trace)
+    registry = tools or default_registry()
+    step_outputs = _run_steps(program, context, inputs, client, registry, trace)
 
     output = _evaluate_emit(
         program.emit, context, inputs, step_outputs, client, trace
@@ -91,33 +99,162 @@ def _run_steps(
     context: Mapping[str, str],
     inputs: Mapping[str, str],
     client: LLMClient,
+    registry: ToolRegistry,
     trace: Trace,
 ) -> Dict[str, str]:
     step_outputs: Dict[str, str] = {}
     for step in program.steps.steps:
-        prompt = _render_expression(step.prompt, context, inputs, step_outputs)
-        trace.append(
-            TraceEvent(
-                phase="step",
-                message=f"Calling LLM for step '{step.name}'",
-                data={"step": step.name, "model": step.model, "prompt": prompt},
+        if isinstance(step, AgentStep):
+            output = _run_agent_step(
+                step, context, inputs, step_outputs, client, registry, trace
             )
+        else:
+            output = _run_llm_step(step, context, inputs, step_outputs, client, trace)
+        step_outputs[step.name] = output
+    return step_outputs
+
+
+def _run_llm_step(
+    step: Step,
+    context: Mapping[str, str],
+    inputs: Mapping[str, str],
+    step_outputs: Mapping[str, str],
+    client: LLMClient,
+    trace: Trace,
+) -> str:
+    prompt = _render_expression(step.prompt, context, inputs, step_outputs)
+    trace.append(
+        TraceEvent(
+            phase="step",
+            message=f"Calling LLM for step '{step.name}'",
+            data={"step": step.name, "model": step.model, "prompt": prompt},
         )
+    )
+    try:
+        response = client.complete(model=step.model, prompt=prompt)
+    except Exception as exc:
+        raise RuntimeError(
+            f"LLM call failed in step '{step.name}': {type(exc).__name__}: {exc}"
+        ) from exc
+    trace.append(
+        TraceEvent(
+            phase="step",
+            message=f"Step '{step.name}' produced output",
+            data={"step": step.name, "output": response},
+        )
+    )
+    return response
+
+
+def _run_agent_step(
+    step: AgentStep,
+    context: Mapping[str, str],
+    inputs: Mapping[str, str],
+    step_outputs: Mapping[str, str],
+    client: LLMClient,
+    registry: ToolRegistry,
+    trace: Trace,
+) -> str:
+    """Run a tool-use loop: render the opening prompt, then call the model up
+    to `max_iters` times, executing every tool the model asks for and feeding
+    the result back, until the model returns a tool-free final answer. Every
+    model turn, every tool call, and every tool result is a TraceEvent — the
+    loop is fully reconstructible from the trace."""
+    agent_step = getattr(client, "agent_step", None)
+    if agent_step is None:
+        raise RuntimeError(
+            f"agent step '{step.name}' needs an agent-capable client "
+            f"(got {type(client).__name__}, which only does .complete)"
+        )
+
+    for tool_name in step.tools:
+        if not registry.has(tool_name):
+            raise RuntimeError(
+                f"agent step '{step.name}' references unknown tool: {tool_name}"
+            )
+    specs = registry.specs(list(step.tools))
+    allowed = set(step.tools)
+
+    prompt = _render_expression(step.prompt, context, inputs, step_outputs)
+    messages: list[Message] = [{"role": "user", "content": prompt}]
+    trace.append(
+        TraceEvent(
+            phase="agent",
+            message=f"Agent step '{step.name}' started",
+            data={
+                "step": step.name,
+                "model": step.model,
+                "prompt": prompt,
+                "tools": list(step.tools),
+                "max_iters": step.max_iters,
+            },
+        )
+    )
+
+    for turn in range(step.max_iters):
         try:
-            response = client.complete(model=step.model, prompt=prompt)
+            response = agent_step(model=step.model, messages=messages, tools=specs)
         except Exception as exc:
             raise RuntimeError(
-                f"LLM call failed in step '{step.name}': {type(exc).__name__}: {exc}"
+                f"LLM call failed in agent step '{step.name}': {type(exc).__name__}: {exc}"
             ) from exc
-        step_outputs[step.name] = response
+
         trace.append(
             TraceEvent(
-                phase="step",
-                message=f"Step '{step.name}' produced output",
-                data={"step": step.name, "output": response},
+                phase="agent",
+                message=f"Agent '{step.name}' turn {turn}",
+                data={
+                    "step": step.name,
+                    "turn": turn,
+                    "text": response.text,
+                    "tool_calls": [
+                        {"name": c.name, "arguments": c.arguments}
+                        for c in response.tool_calls
+                    ],
+                },
             )
         )
-    return step_outputs
+
+        if not response.tool_calls:
+            trace.append(
+                TraceEvent(
+                    phase="agent",
+                    message=f"Agent '{step.name}' finished",
+                    data={"step": step.name, "turns": turn + 1, "output": response.text},
+                )
+            )
+            return response.text
+
+        messages.append(
+            {"role": "assistant", "text": response.text, "tool_calls": response.tool_calls}
+        )
+        for call in response.tool_calls:
+            if call.name in allowed and registry.has(call.name):
+                try:
+                    result = registry.get(call.name).run(call.arguments)
+                except Exception as exc:
+                    result = f"error: {type(exc).__name__}: {exc}"
+            else:
+                result = f"error: tool '{call.name}' is not available to this agent"
+            trace.append(
+                TraceEvent(
+                    phase="agent",
+                    message=f"Tool '{call.name}' called",
+                    data={
+                        "step": step.name,
+                        "tool": call.name,
+                        "arguments": call.arguments,
+                        "result": result,
+                    },
+                )
+            )
+            messages.append(
+                {"role": "tool", "tool_call_id": call.id, "content": result}
+            )
+
+    raise RuntimeError(
+        f"agent step '{step.name}' exceeded max_iters ({step.max_iters}) without a final answer"
+    )
 
 
 def _evaluate_emit(

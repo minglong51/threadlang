@@ -1,4 +1,4 @@
-(* ThreadLang v1 grammar *)
+(* ThreadLang grammar (v0.3 — adds agent steps) *)
 
 program        = "thread", ws, identifier, ws, "{", ws,
                  context_block,
@@ -10,9 +10,14 @@ context_block  = "context", ws, "{", ws, assignment, { ws, assignment }, ws, "}"
 assignment     = identifier, ws, "=", ws, string_literal ;
 
 steps_block    = "steps", ws, "{", ws, step, { ws, step }, ws, "}" ;
-step           = "step", ws, identifier, ws, "{", ws,
-                 "llm", ws, string_literal, ws, "{", ws, expression, ws, "}",
-                 ws, "}" ;
+step           = "step", ws, identifier, ws, "{", ws, ( llm_body | agent_body ), ws, "}" ;
+llm_body       = "llm", ws, string_literal, ws, "{", ws, expression, ws, "}" ;
+agent_body     = "agent", ws, string_literal, ws, "{", ws,
+                 [ tools_decl, ws ], [ max_iters_decl, ws ], expression, ws, "}" ;
+tools_decl     = "tools", ws, "[", ws,
+                 [ identifier, { ws, ",", ws, identifier } ], ws, "]" ;
+max_iters_decl = "max_iters", ws, integer ;
+integer        = digit, { digit } ;
 
 emit_block     = emit_text | emit_llm ;
 emit_text      = "emit", ws, "text", ws, "{", ws, expression, ws, "}" ;

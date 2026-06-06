@@ -1,0 +1,19 @@
+thread Researcher {
+  context {
+    persona = "a precise assistant that uses tools and shows its work"
+  }
+
+  steps {
+    step solve {
+      agent "claude-haiku-4-5-20251001" {
+        tools [ echo, calculator ]
+        max_iters 4
+        "You are " + context.persona + ". Use a tool if it helps. Task: " + inputs.task
+      }
+    }
+  }
+
+  emit text {
+    steps.solve.output
+  }
+}

@@ -26,6 +26,7 @@ import re
 from typing import List
 
 from .ast import (
+    AgentStep,
     ContextAssignment,
     ContextBlock,
     ContextRef,
@@ -34,10 +35,13 @@ from .ast import (
     InputsRef,
     Program,
     Step,
+    StepNode,
     StepsBlock,
     StepsRef,
     StringLiteral,
 )
+
+DEFAULT_MAX_ITERS = 6
 
 
 class ParseError(ValueError):
@@ -48,19 +52,19 @@ _THREAD_RE = re.compile(
     r"\s*thread\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{(.*)\}\s*", re.DOTALL
 )
 _CONTEXT_RE = re.compile(r"context\s*\{([^{}]*)\}", re.DOTALL)
-# `steps { step a { llm "m" { ... } } step b { ... } }` — body can contain
-# nested braces, so use a permissive non-greedy match and rely on the per-step
-# regex to actually structure it.
-_STEPS_RE = re.compile(
-    r"steps\s*\{((?:[^{}]|\{[^{}]*\}|\{[^{}]*\{[^{}]*\}[^{}]*\})*)\}",
-    re.DOTALL,
-)
-_STEP_RE = re.compile(
-    r"step\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{"
-    r"\s*llm\s+\"([^\"]+)\"\s*\{([^{}]*)\}\s*"
-    r"\}",
-    re.DOTALL,
-)
+# A step now carries either an `llm` body or an `agent` body, and an agent body
+# nests deeper than the old two-level regex could track. The steps block is
+# located by keyword and carved out with a brace-balanced scan (see
+# `_extract_braced`); each `step <name> { ... }` is then carved the same way and
+# dispatched by body kind. This preserves declaration order across mixed step
+# kinds — which a per-kind regex sweep could not.
+_STEPS_HEAD_RE = re.compile(r"\bsteps\s*\{")
+_STEP_HEAD_RE = re.compile(r"\bstep\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{")
+_LLM_BODY_RE = re.compile(r'\s*llm\s+"([^"]+)"\s*\{(.*)\}\s*', re.DOTALL)
+_AGENT_BODY_RE = re.compile(r'\s*agent\s+"([^"]+)"\s*\{(.*)\}\s*', re.DOTALL)
+_TOOLS_RE = re.compile(r"\btools\s*\[([^\]]*)\]")
+_MAX_ITERS_RE = re.compile(r"\bmax_iters\s+(\d+)")
+_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _EMIT_TEXT_RE = re.compile(r"emit\s+text\s*\{([^{}]*)\}", re.DOTALL)
 _EMIT_LLM_RE = re.compile(r"emit\s+llm\s+\"([^\"]+)\"\s*\{([^{}]*)\}", re.DOTALL)
 _CONTEXT_ASSIGN_RE = re.compile(r'([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"([^"]*)"')
@@ -107,32 +111,108 @@ def _parse_context_block(body: str) -> ContextBlock:
     return ContextBlock(assignments=assignments)
 
 
+def _extract_braced(text: str, brace_index: int) -> tuple[str, int]:
+    """Given the index of an opening `{`, return (inner_text, close_index) for
+    the matching `}`. Raises if the braces never balance."""
+    depth = 0
+    for i in range(brace_index, len(text)):
+        char = text[i]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[brace_index + 1 : i], i
+    raise ParseError("Unbalanced braces in steps block")
+
+
 def _parse_steps_block(body: str) -> StepsBlock:
-    match = _STEPS_RE.search(body)
-    if not match:
+    head = _STEPS_HEAD_RE.search(body)
+    if not head:
         return StepsBlock(steps=[])
 
-    steps_body = match.group(1)
-    steps: List[Step] = []
+    steps_body, _ = _extract_braced(body, head.end() - 1)
+
+    steps: List[StepNode] = []
     seen_names: set[str] = set()
-    for step_match in _STEP_RE.finditer(steps_body):
-        name = step_match.group(1)
-        model = step_match.group(2)
-        prompt_text = step_match.group(3)
+    pos = 0
+    while True:
+        step_head = _STEP_HEAD_RE.search(steps_body, pos)
+        if not step_head:
+            break
+        name = step_head.group(1)
+        step_body, close_index = _extract_braced(steps_body, step_head.end() - 1)
         if name in seen_names:
             raise ParseError(f"Duplicate step name: {name}")
         seen_names.add(name)
-        steps.append(Step(name=name, model=model, prompt=_parse_expression(prompt_text)))
+        steps.append(_parse_step_body(name, step_body))
+        pos = close_index + 1
 
     # If the steps block exists but no step parsed, the user wrote something
     # unsupported; fail loud rather than silently dropping their code.
     if not steps and steps_body.strip():
         raise ParseError(
             "steps block present but no valid step found. "
-            'Expected: step <name> { llm "<model>" { <expression> } }'
+            'Expected: step <name> { llm "<model>" { <expression> } } '
+            'or step <name> { agent "<model>" { ... } }'
         )
 
     return StepsBlock(steps=steps)
+
+
+def _join_expression_text(raw: str) -> str:
+    return " ".join(line.strip() for line in raw.splitlines() if line.strip()).strip()
+
+
+def _parse_step_body(name: str, step_body: str) -> StepNode:
+    llm_match = _LLM_BODY_RE.fullmatch(step_body)
+    if llm_match:
+        model = llm_match.group(1)
+        expression_text = _join_expression_text(llm_match.group(2))
+        if not expression_text:
+            raise ParseError(f"step '{name}': llm body must include a prompt expression")
+        return Step(name=name, model=model, prompt=_parse_expression(expression_text))
+
+    agent_match = _AGENT_BODY_RE.fullmatch(step_body)
+    if agent_match:
+        return _parse_agent_step(name, agent_match.group(1), agent_match.group(2))
+
+    raise ParseError(
+        f"step '{name}': body must be llm \"<model>\" {{ ... }} or agent \"<model>\" {{ ... }}"
+    )
+
+
+def _parse_agent_step(name: str, model: str, inner: str) -> AgentStep:
+    """Parse an agent body: optional `tools [...]`, optional `max_iters N`, and
+    a prompt expression (everything left over)."""
+    tools: tuple[str, ...] = ()
+    tools_match = _TOOLS_RE.search(inner)
+    if tools_match:
+        raw_names = [t.strip() for t in tools_match.group(1).split(",") if t.strip()]
+        for tool_name in raw_names:
+            if not _IDENT_RE.fullmatch(tool_name):
+                raise ParseError(f"agent '{name}': invalid tool name: {tool_name}")
+        tools = tuple(raw_names)
+        inner = inner[: tools_match.start()] + inner[tools_match.end() :]
+
+    max_iters = DEFAULT_MAX_ITERS
+    iters_match = _MAX_ITERS_RE.search(inner)
+    if iters_match:
+        max_iters = int(iters_match.group(1))
+        if max_iters < 1:
+            raise ParseError(f"agent '{name}': max_iters must be >= 1")
+        inner = inner[: iters_match.start()] + inner[iters_match.end() :]
+
+    expression_text = _join_expression_text(inner)
+    if not expression_text:
+        raise ParseError(f"agent '{name}': missing prompt expression")
+    return AgentStep(
+        name=name,
+        model=model,
+        prompt=_parse_expression(expression_text),
+        tools=tools,
+        max_iters=max_iters,
+    )
 
 
 def _parse_emit_block(body: str) -> EmitBlock:

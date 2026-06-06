@@ -1,7 +1,7 @@
 """AST node definitions for ThreadLang."""
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 
 @dataclass(frozen=True)
@@ -47,10 +47,10 @@ class Expression:
 
 @dataclass(frozen=True)
 class Step:
-    """One ordered workflow transformation.
+    """A single-shot LLM transformation: `llm "<model>" { <prompt> }`.
 
-    Today: a single `llm "<model>" { <prompt expression> }` body. Future:
-    other step kinds (e.g., transform, validate).
+    Renders its prompt once, calls the model, binds the response to
+    `steps.<name>.output`. No tools, no loop — deterministic chaining.
     """
 
     name: str
@@ -59,8 +59,28 @@ class Step:
 
 
 @dataclass(frozen=True)
+class AgentStep:
+    """A tool-using agent: `agent "<model>" { tools [...] max_iters N <prompt> }`.
+
+    Renders its prompt as the opening instruction, then runs a tool-use loop
+    (model → tool calls → observations → model) up to `max_iters` turns. The
+    model may only call tools named in `tools`. The final text is bound to
+    `steps.<name>.output`.
+    """
+
+    name: str
+    model: str
+    prompt: Expression
+    tools: Tuple[str, ...] = ()
+    max_iters: int = 6
+
+
+StepNode = Union[Step, AgentStep]
+
+
+@dataclass(frozen=True)
 class StepsBlock:
-    steps: List[Step] = field(default_factory=list)
+    steps: List[StepNode] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
