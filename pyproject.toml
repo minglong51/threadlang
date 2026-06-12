@@ -19,6 +19,7 @@ anthropic = ["anthropic>=0.40,<1.0"]
 where = ["src"]
 
 [tool.setuptools.package-data]
+threadlang = ["py.typed"]
 "threadlang.apps.support_triage" = ["*.thread"]
 
 [project.scripts]

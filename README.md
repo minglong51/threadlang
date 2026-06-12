@@ -1,5 +1,7 @@
 # ThreadLang
 
+[![CI](https://github.com/minglong51/threadlang/actions/workflows/ci.yml/badge.svg)](https://github.com/minglong51/threadlang/actions/workflows/ci.yml)
+
 A small DSL for **deterministic, fully-traceable LLM and agent workflows** —
 the authoring layer of an agent platform whose bet is that every run should be
 a replayable, inspectable trace. Execution is **parse → AST → runtime → emit**,
@@ -73,6 +75,12 @@ threadlang examples/two_step.thread --input text="..." --dry-run --trace
 
 # v0.3 agent step — runs a tool-use loop (dry-run needs no API key)
 threadlang examples/agent.thread --input task="what is 21*2?" --dry-run --trace
+
+# fuller pipeline — an agent step feeding two llm steps, run durably with metrics
+threadlang examples/release_report.thread \
+  --input stats="errors per hour went from 40 to 10; p95 latency went from 900ms to 450ms" \
+  --input notes="Shipped retry logic and connection pooling for the ingest path" \
+  --dry-run --store runs.db --metrics
 ```
 
 ## Backends

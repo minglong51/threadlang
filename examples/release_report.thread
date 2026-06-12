@@ -1,0 +1,32 @@
+thread ReleaseReport {
+  context {
+    audience = "an engineering manager skimming before standup"
+    voice = "plain and factual, no hype"
+  }
+
+  steps {
+    step compute {
+      agent "deepseek-chat" {
+        tools [ calculator, echo ]
+        max_iters 4
+        "Work out the percentage change implied by these release stats. Use the calculator tool for any arithmetic; do not estimate. Report each figure on its own line. Stats:\n" + inputs.stats
+      }
+    }
+
+    step assess {
+      llm "deepseek-chat" {
+        "Given these computed figures:\n" + steps.compute.output + "\n\nand these release notes:\n" + inputs.notes + "\n\nState the two most important takeaways, one line each, citing a figure where one applies."
+      }
+    }
+
+    step brief {
+      llm "deepseek-chat" {
+        "Rewrite the takeaways for " + context.audience + " in a voice that is " + context.voice + ". Keep every figure. Takeaways:\n" + steps.assess.output
+      }
+    }
+  }
+
+  emit text {
+    steps.brief.output
+  }
+}
