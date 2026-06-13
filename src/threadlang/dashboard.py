@@ -81,6 +81,7 @@ _PHASE_COLOR = {
     "context": "#9aa0a6",
     "step": "#1a73e8",
     "agent": "#a142f4",
+    "denial": "#d93025",
     "runtime": "#5f6368",
     "emit": "#188038",
 }
@@ -135,6 +136,8 @@ def _run_metrics_panel(metrics: RunMetrics) -> str:
     ]
     if metrics.tool_errors:
         chips.append(_metric_chip("tool errors", metrics.tool_errors, warn=True))
+    if metrics.denials:
+        chips.append(_metric_chip("denials", metrics.denials, warn=True))
     if metrics.resumed_steps:
         chips.append(_metric_chip("resumed", metrics.resumed_steps, warn=True))
     chips.append(_metric_chip("duration", _fmt_ms(metrics.duration_ms)))
@@ -156,6 +159,8 @@ def _aggregate_panel(agg: AggregateMetrics) -> str:
     ]
     if agg.total_tool_errors:
         chips.append(_metric_chip("tool errors", agg.total_tool_errors, warn=True))
+    if agg.total_denials:
+        chips.append(_metric_chip("denials", agg.total_denials, warn=True))
     return "<div class='metrics'>" + "".join(chips) + "</div>"
 
 
@@ -225,10 +230,11 @@ def render_run_detail(
     timeline = ["<h3>Trace</h3>"]
     for event in events:
         dot = _PHASE_COLOR.get(event.phase, "#5f6368")
+        cls = "event err" if event.phase == "denial" else "event"
         data = _esc(json.dumps(event.data, indent=2)) if event.data else ""
         pre = f"<pre>{data}</pre>" if data else ""
         timeline.append(
-            f"<div class='event' style='--c:{dot}'>"
+            f"<div class='{cls}' style='--c:{dot}'>"
             f"<div class='phase' style='color:{dot}'>{_esc(event.phase)}</div>"
             f"<div class='msg'>{_esc(event.message)}</div>{pre}</div>"
         )

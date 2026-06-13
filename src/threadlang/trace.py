@@ -1,7 +1,13 @@
 """Runtime trace structures for ThreadLang."""
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Dict, List
+
+
+class DenialCode(str, Enum):
+    TOOL_NOT_ALLOWED = "tool-not-allowed"
+    TOOL_NOT_REGISTERED = "tool-not-registered"
 
 
 @dataclass(frozen=True)

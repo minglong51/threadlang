@@ -34,7 +34,7 @@ from .ast import (
 )
 from .llm import DryRunClient, LLMClient, Message
 from .tools import ToolRegistry, default_registry
-from .trace import Trace, TraceEvent
+from .trace import DenialCode, Trace, TraceEvent
 
 
 class RuntimeError(ValueError):
@@ -267,20 +267,38 @@ def _run_agent_step(
                     result = registry.get(call.name).run(call.arguments)
                 except Exception as exc:
                     result = f"error: {type(exc).__name__}: {exc}"
-            else:
-                result = f"error: tool '{call.name}' is not available to this agent"
-            trace.append(
-                TraceEvent(
-                    phase="agent",
-                    message=f"Tool '{call.name}' called",
-                    data={
-                        "step": step.name,
-                        "tool": call.name,
-                        "arguments": call.arguments,
-                        "result": result,
-                    },
+                trace.append(
+                    TraceEvent(
+                        phase="agent",
+                        message=f"Tool '{call.name}' called",
+                        data={
+                            "step": step.name,
+                            "tool": call.name,
+                            "arguments": call.arguments,
+                            "result": result,
+                        },
+                    )
                 )
-            )
+            else:
+                code = (
+                    DenialCode.TOOL_NOT_ALLOWED
+                    if call.name not in allowed
+                    else DenialCode.TOOL_NOT_REGISTERED
+                )
+                result = f"error: {code.value}: tool '{call.name}' is not available to this agent"
+                trace.append(
+                    TraceEvent(
+                        phase="denial",
+                        message=f"Tool '{call.name}' denied",
+                        data={
+                            "step": step.name,
+                            "tool": call.name,
+                            "arguments": call.arguments,
+                            "code": code.value,
+                            "result": result,
+                        },
+                    )
+                )
             messages.append(
                 {"role": "tool", "tool_call_id": call.id, "content": result}
             )

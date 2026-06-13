@@ -60,6 +60,7 @@ class RunMetrics:
     model_calls: int  # complete() + agent_step() model invocations
     tool_calls: int
     tool_errors: int
+    denials: int
     resumed_steps: int
     status: Optional[str]
 
@@ -88,6 +89,7 @@ class RunMetrics:
                 "model_calls": self.model_calls,
                 "tool_calls": self.tool_calls,
                 "tool_errors": self.tool_errors,
+                "denials": self.denials,
                 "resumed_steps": self.resumed_steps,
                 "status": self.status,
             },
@@ -116,6 +118,7 @@ def compute_metrics(
     agent_turns = 0  # agent_step() model invocations inside tool-use loops
     tool_calls = 0
     tool_errors = 0
+    denials = 0
     resumed_steps = 0
     completed_steps: set = set()
     in_tok = 0
@@ -147,6 +150,8 @@ def compute_metrics(
                     tool_errors += 1
             elif message.endswith("finished"):
                 completed_steps.add(data.get("step"))
+        elif phase == "denial":
+            denials += 1
         elif phase == "emit" and message == "Calling LLM for emit":
             llm_calls += 1
 
@@ -164,6 +169,7 @@ def compute_metrics(
         model_calls=llm_calls + agent_turns,
         tool_calls=tool_calls,
         tool_errors=tool_errors,
+        denials=denials,
         resumed_steps=resumed_steps,
         status=status,
         duration_ms=duration_ms,
@@ -202,6 +208,7 @@ class AggregateMetrics:
     total_model_calls: int
     total_tool_calls: int
     total_tool_errors: int
+    total_denials: int
     by_program: Dict[str, Dict[str, object]]
 
     def to_dict(self) -> Dict[str, object]:
@@ -213,6 +220,7 @@ class AggregateMetrics:
             "total_model_calls": self.total_model_calls,
             "total_tool_calls": self.total_tool_calls,
             "total_tool_errors": self.total_tool_errors,
+            "total_denials": self.total_denials,
             "by_program": self.by_program,
         }
 
@@ -226,6 +234,7 @@ def aggregate(items: Sequence[Tuple[str, RunMetrics]]) -> AggregateMetrics:
     total_model_calls = 0
     total_tool_calls = 0
     total_tool_errors = 0
+    total_denials = 0
     # program -> mutable accumulator
     progs: Dict[str, Dict[str, object]] = {}
 
@@ -242,6 +251,7 @@ def aggregate(items: Sequence[Tuple[str, RunMetrics]]) -> AggregateMetrics:
         total_model_calls += m.model_calls
         total_tool_calls += m.tool_calls
         total_tool_errors += m.tool_errors
+        total_denials += m.denials
 
         p = progs.setdefault(
             program_name,
@@ -277,5 +287,6 @@ def aggregate(items: Sequence[Tuple[str, RunMetrics]]) -> AggregateMetrics:
         total_model_calls=total_model_calls,
         total_tool_calls=total_tool_calls,
         total_tool_errors=total_tool_errors,
+        total_denials=total_denials,
         by_program=by_program,
     )

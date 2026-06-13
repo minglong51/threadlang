@@ -26,6 +26,7 @@ from threadlang.llm import AgentTurn, DryRunClient, ToolCall  # noqa: E402
 from threadlang.parser import ParseError, parse_program  # noqa: E402
 from threadlang.runtime import RuntimeError as TLRuntimeError, run_program  # noqa: E402
 from threadlang.tools import ToolRegistry, default_registry  # noqa: E402
+from threadlang.trace import DenialCode  # noqa: E402
 
 
 def _agent_source(tools: str = "[ echo, calculator ]", max_iters: int = 4) -> str:
@@ -158,11 +159,11 @@ def test_agent_cannot_call_a_tool_it_was_not_given() -> None:
     }
     """
     result = run_program(parse_program(source), inputs={}, llm_client=RogueAgent())
-    blocked = [
-        e for e in result.trace
-        if e.message.startswith("Tool 'calculator'") and "not available" in e.data["result"]
-    ]
+    blocked = [e for e in result.trace if e.phase == "denial"]
     assert blocked, "calculator should have been refused — it was not in the allow-list"
+    assert blocked[0].message == "Tool 'calculator' denied"
+    assert blocked[0].data["code"] == DenialCode.TOOL_NOT_ALLOWED.value
+    assert "not available" in blocked[0].data["result"]
 
 
 # ───────── parser: mixed steps, ordering, validation ─────────

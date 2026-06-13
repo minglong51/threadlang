@@ -125,6 +125,18 @@ def test_tool_errors_are_counted() -> None:
     m = compute_metrics(trace)
     assert m.tool_calls == 1
     assert m.tool_errors == 1
+    assert m.denials == 0
+
+
+def test_denials_are_counted() -> None:
+    trace = [
+        TraceEvent("agent", "Agent step 's' started", {"step": "s"}),
+        TraceEvent("denial", "Tool 'rogue' denied", {"tool": "rogue", "code": "tool-not-allowed"}),
+        TraceEvent("agent", "Agent 's' finished", {"step": "s"}),
+    ]
+    m = compute_metrics(trace)
+    assert m.denials == 1
+    assert m.tool_calls == 0
 
 
 # ---- 3. token usage: summed when present, None when absent ----
