@@ -198,6 +198,19 @@ class RunStore:
             source=record.source,
         )
 
+    def requeue_orphans(self) -> int:
+        """Reset runs stranded in `running` (e.g. by a process crash or
+        restart) back to `pending` so a worker can re-claim them. Only runs
+        with a persisted `source` are requeued — re-dispatch needs the program
+        text. Safe because resume via `run_durable` is idempotent. Returns the
+        number of runs requeued."""
+        cursor = self._conn.execute(
+            "UPDATE runs SET status = 'pending', updated_at = ? "
+            "WHERE status = 'running' AND source IS NOT NULL",
+            (_now(),),
+        )
+        return cursor.rowcount
+
     def mark_running(self, run_id: str) -> None:
         self._conn.execute(
             "UPDATE runs SET status = 'running', error = NULL, updated_at = ? WHERE id = ?",

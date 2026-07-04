@@ -51,7 +51,7 @@ def main() -> int:
         "--base-url",
         default=None,
         help="Override the OpenAI-compatible endpoint for --backend openai "
-        "(e.g. http://100.76.118.28:11434/v1 for a local Ollama).",
+        "(e.g. http://<host>:11434/v1 for a local Ollama).",
     )
     parser.add_argument(
         "--store",
@@ -80,10 +80,20 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    import sys
+
     if args.resume and not args.store:
-        print("error: --resume requires --store", file=__import__("sys").stderr)
+        print("error: --resume requires --store", file=sys.stderr)
         return 2
 
+    try:
+        return _run(args)
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+
+def _run(args: argparse.Namespace) -> int:
     source_text = args.source.read_text(encoding="utf-8")
     program = parse_program(source_text)
 
@@ -114,6 +124,10 @@ def main() -> int:
     result: RuntimeResult
     if args.store:
         store = RunStore(args.store)
+        if args.resume:
+            prior = store.get_run(args.resume)
+            if prior is not None:
+                inputs = {**prior.inputs, **inputs}
         # Establish the run id up front (create fresh, or reuse the one being
         # resumed) so we can report it even if the run crashes mid-flight.
         run_id = args.resume or store.create_run(program.thread_name, inputs)
@@ -125,7 +139,7 @@ def main() -> int:
             # tell the user how to resume from exactly where it died.
             print(f"error: {exc}", file=sys.stderr)
             print(
-                f"  run failed; resume with: --store {args.store} --resume {run_id}",
+                f"  run failed; resume with: threadlang {args.source} --store {args.store} --resume {run_id}",
                 file=sys.stderr,
             )
             store.close()

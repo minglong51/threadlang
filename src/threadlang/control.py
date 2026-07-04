@@ -85,6 +85,11 @@ class WorkerPool:
         self._threads: list[threading.Thread] = []
 
     def start(self) -> None:
+        store = RunStore(self._store_path)
+        try:
+            store.requeue_orphans()
+        finally:
+            store.close()
         for i in range(self._n_workers):
             t = threading.Thread(target=self._loop, name=f"tl-worker-{i}", daemon=True)
             t.start()
