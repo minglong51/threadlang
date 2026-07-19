@@ -1,0 +1,29 @@
+thread ContractDemo {
+  context {
+    persona = "a decisive reviewer"
+  }
+
+  steps {
+    step verdict {
+      llm "deepseek-chat" {
+        "You are " + context.persona + ". Should this change ship? " + inputs.change
+        expect {
+          one_of "ship", "hold"
+        }
+      }
+    }
+
+    step reason {
+      llm "deepseek-chat" {
+        "In one short sentence, justify the verdict '" + steps.verdict.output + "' for: " + inputs.change
+        expect {
+          nonempty
+        }
+      }
+    }
+  }
+
+  emit text {
+    steps.verdict.output + ": " + steps.reason.output
+  }
+}

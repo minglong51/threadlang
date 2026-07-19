@@ -82,6 +82,7 @@ _PHASE_COLOR = {
     "step": "#1a73e8",
     "agent": "#a142f4",
     "route": "#f6a609",
+    "contract": "#e8710a",
     "denial": "#d93025",
     "runtime": "#5f6368",
     "emit": "#188038",
@@ -139,6 +140,10 @@ def _run_metrics_panel(metrics: RunMetrics) -> str:
         chips.append(_metric_chip("routes", metrics.route_steps))
     if metrics.route_violations:
         chips.append(_metric_chip("route violations", metrics.route_violations, warn=True))
+    if metrics.contract_violations:
+        chips.append(
+            _metric_chip("contract violations", metrics.contract_violations, warn=True)
+        )
     if metrics.tool_errors:
         chips.append(_metric_chip("tool errors", metrics.tool_errors, warn=True))
     if metrics.denials:

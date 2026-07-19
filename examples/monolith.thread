@@ -1,0 +1,19 @@
+thread MonolithDemo {
+  context {
+    persona = "a concise assistant"
+  }
+
+  steps {
+    step handle {
+      agent "deepseek-chat" {
+        tools [ echo, calculator ]
+        max_iters 6
+        "You are " + context.persona + ". Decide whether this request is a math problem or a writing task, then handle it yourself: solve the math showing the result, or write a short response. Task: " + inputs.task
+      }
+    }
+  }
+
+  emit text {
+    steps.handle.output
+  }
+}

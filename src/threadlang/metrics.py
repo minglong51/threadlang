@@ -64,6 +64,7 @@ class RunMetrics:
     resumed_steps: int
     route_steps: int  # routing decisions taken (one per executed route step)
     route_violations: int  # route replies rejected by the output contract
+    contract_violations: int  # llm-step replies rejected by an expect contract
     status: Optional[str]
 
     # ── observational: depend on wall-clock / the model (not reproducible) ──
@@ -95,6 +96,7 @@ class RunMetrics:
                 "resumed_steps": self.resumed_steps,
                 "route_steps": self.route_steps,
                 "route_violations": self.route_violations,
+                "contract_violations": self.contract_violations,
                 "status": self.status,
             },
             "observational": {
@@ -126,6 +128,7 @@ def compute_metrics(
     resumed_steps = 0
     route_steps = 0
     route_violations = 0
+    contract_violations = 0
     completed_steps: set = set()
     in_tok = 0
     out_tok = 0
@@ -167,6 +170,8 @@ def compute_metrics(
             elif "resumed from checkpoint" in message:
                 resumed_steps += 1
                 completed_steps.add(data.get("step"))
+        elif phase == "contract" and "output rejected" in message:
+            contract_violations += 1
         elif phase == "denial":
             denials += 1
         elif phase == "emit" and message == "Calling LLM for emit":
@@ -190,6 +195,7 @@ def compute_metrics(
         resumed_steps=resumed_steps,
         route_steps=route_steps,
         route_violations=route_violations,
+        contract_violations=contract_violations,
         status=status,
         duration_ms=duration_ms,
         input_tokens=in_tok if saw_usage else None,

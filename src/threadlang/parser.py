@@ -6,6 +6,10 @@ Grammar (informal):
     context     = "context" "{" { name "=" string } "}"
     steps       = "steps" "{" { step } "}"
     step        = "step" name "{" ( llm_body | agent_body | route_body ) "}"
+    llm_body    = "llm" string "{" expression [ expect ] [ then ] "}"
+    expect      = "expect" "{" rule { rule } "}"
+    rule        = "one_of" string { "," string } | "matches" string
+                | "max_chars" number | "nonempty"
     route_body  = "route" string "{" expression arm { arm } [ "else" "->" name ] "}"
     arm         = "on" string "->" ( name | "end" )
     emit_text   = "emit" "text" "{" expression "}"
@@ -40,6 +44,7 @@ from .ast import (
     ContextBlock,
     ContextRef,
     EmitBlock,
+    ExpectRule,
     Expression,
     InputsRef,
     Program,
@@ -77,6 +82,10 @@ _ROUTE_BODY_RE = re.compile(r'\s*route\s+"([^"]+)"\s*\{(.*)\}\s*', re.DOTALL)
 _TOOLS_RE = re.compile(r"\btools\s*\[([^\]]*)\]")
 _MAX_ITERS_RE = re.compile(r"\bmax_iters\s+(\d+)")
 _THEN_RE = re.compile(r"\bthen\s*->\s*([A-Za-z_][A-Za-z0-9_]*)")
+_EXPECT_HEAD_RE = re.compile(r"\bexpect\s*\{")
+_RULE_ONE_OF_RE = re.compile(r'one_of\s+("[^"]+"(?:\s*,\s*"[^"]+")*)')
+_RULE_MATCHES_RE = re.compile(r'matches\s+"([^"]+)"')
+_RULE_MAX_CHARS_RE = re.compile(r"max_chars\s+(\d+)")
 _ARM_RE = re.compile(r'\bon\s+"([^"]+)"\s*->\s*([A-Za-z_][A-Za-z0-9_]*)')
 _ELSE_RE = re.compile(r"\belse\s*->\s*([A-Za-z_][A-Za-z0-9_]*)")
 _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -232,11 +241,66 @@ def _parse_then(name: str, inner: str) -> tuple[str, str | None]:
     return inner, target
 
 
+def _parse_expect(name: str, inner: str) -> tuple[str, tuple[ExpectRule, ...]]:
+    """Extract an optional `expect { ... }` output contract from an llm body,
+    returning (remaining_body, rules). Rules are one per line, validated at
+    parse time so a bad contract fails before any model call."""
+    head = _EXPECT_HEAD_RE.search(inner)
+    if not head:
+        return inner, ()
+    expect_body, close_index = _extract_braced(inner, head.end() - 1)
+    inner = inner[: head.start()] + inner[close_index + 1 :]
+    if _EXPECT_HEAD_RE.search(inner):
+        raise ParseError(f"step '{name}': multiple expect blocks")
+
+    rules: List[ExpectRule] = []
+    seen_kinds: set[str] = set()
+
+    def add(rule: ExpectRule) -> None:
+        # `matches` may repeat (a conjunction of patterns); the others may not.
+        if rule.kind != "matches" and rule.kind in seen_kinds:
+            raise ParseError(f"step '{name}': duplicate expect rule: {rule.kind}")
+        seen_kinds.add(rule.kind)
+        rules.append(rule)
+
+    for line in expect_body.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped == "nonempty":
+            add(ExpectRule(kind="nonempty"))
+        elif (m := _RULE_ONE_OF_RE.fullmatch(stripped)) is not None:
+            values = re.findall(r'"([^"]+)"', m.group(1))
+            if len({v.casefold() for v in values}) != len(values):
+                raise ParseError(f"step '{name}': one_of has duplicate values")
+            add(ExpectRule(kind="one_of", values=tuple(values)))
+        elif (m := _RULE_MATCHES_RE.fullmatch(stripped)) is not None:
+            try:
+                re.compile(m.group(1))
+            except re.error as exc:
+                raise ParseError(
+                    f"step '{name}': matches has an invalid regex: {exc}"
+                ) from exc
+            add(ExpectRule(kind="matches", pattern=m.group(1)))
+        elif (m := _RULE_MAX_CHARS_RE.fullmatch(stripped)) is not None:
+            limit = int(m.group(1))
+            if limit < 1:
+                raise ParseError(f"step '{name}': max_chars must be >= 1")
+            add(ExpectRule(kind="max_chars", limit=limit))
+        else:
+            raise ParseError(f"step '{name}': invalid expect rule: {stripped}")
+
+    if not rules:
+        raise ParseError(f"step '{name}': expect block must contain at least one rule")
+    return inner, tuple(rules)
+
+
 def _parse_step_body(name: str, step_body: str) -> StepNode:
     llm_match = _LLM_BODY_RE.fullmatch(step_body)
     if llm_match:
         model = llm_match.group(1)
-        inner, next_target = _parse_then(name, llm_match.group(2))
+        inner, expect = _parse_expect(name, llm_match.group(2))
+        inner, next_target = _parse_then(name, inner)
         expression_text = _join_expression_text(inner)
         if not expression_text:
             raise ParseError(f"step '{name}': llm body must include a prompt expression")
@@ -245,6 +309,7 @@ def _parse_step_body(name: str, step_body: str) -> StepNode:
             model=model,
             prompt=_parse_expression(expression_text),
             next_target=next_target,
+            expect=expect,
         )
 
     agent_match = _AGENT_BODY_RE.fullmatch(step_body)
@@ -261,9 +326,18 @@ def _parse_step_body(name: str, step_body: str) -> StepNode:
     )
 
 
+def _reject_expect(name: str, kind: str, inner: str) -> None:
+    if _EXPECT_HEAD_RE.search(inner):
+        raise ParseError(
+            f"step '{name}': expect blocks are only supported on llm steps "
+            f"(a {kind} step's contract is its own shape)"
+        )
+
+
 def _parse_route_step(name: str, model: str, inner: str) -> RouteStep:
     """Parse a route body: a prompt expression, one or more `on "<label>" ->
     <target>` arms, and an optional `else -> <target>`."""
+    _reject_expect(name, "route", inner)
     arms: List[RouteArm] = []
     for arm_match in _ARM_RE.finditer(inner):
         arms.append(RouteArm(label=arm_match.group(1), target=arm_match.group(2)))
@@ -297,6 +371,7 @@ def _parse_agent_step(name: str, model: str, inner: str) -> AgentStep:
     """Parse an agent body: optional `tools [...]`, optional `max_iters N`,
     optional `then -> <target>`, and a prompt expression (everything left
     over)."""
+    _reject_expect(name, "agent", inner)
     inner, next_target = _parse_then(name, inner)
     tools: tuple[str, ...] = ()
     tools_match = _TOOLS_RE.search(inner)

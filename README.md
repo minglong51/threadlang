@@ -28,7 +28,9 @@ enum-contracted model decision and deterministic code dispatches the jump —
 forward-only, so checkpoints, resume, and replay survive branching unchanged.
 As of **v0.10** reliability is a [**measurement**](#probes-v010): `--probe N`
 runs a program N times and folds the stored runs into per-step variance,
-route-label distributions, and violation/failure rates.
+route-label distributions, and violation/failure rates. As of **v0.11** any
+`llm` step can carry an [**output contract**](#contracts-v011): an
+`expect { ... }` block the runtime enforces with a feedback retry.
 Build plans: [`docs/design/`](docs/design/).
 
 ```thread
@@ -387,6 +389,44 @@ threadlang examples/route.thread --input task="what is 21*2?" \
 
 Design notes: [`docs/design/phase-7-probes.md`](docs/design/phase-7-probes.md).
 
+## Contracts (v0.11)
+
+Route steps have carried an output contract since v0.9; `expect` gives one to
+any `llm` step. Declare what an acceptable reply is, and the runtime — not the
+prompt author's hope — holds the line:
+
+```thread
+step verdict {
+  llm "deepseek-chat" {
+    "Should this change ship? " + inputs.change
+    expect {
+      one_of "ship", "hold"
+    }
+  }
+}
+```
+
+- Four rules, one per line, all must hold: `one_of "a", "b"` (closed set,
+  route-label normalization, the canonical value is what gets bound),
+  `matches "<regex>"` (fullmatch, repeatable), `max_chars N`, `nonempty`.
+  All validated at parse time — a bad regex fails before any model call.
+- The rendered contract is appended to the prompt, so the model is shown
+  exactly what will be enforced. A violating reply is traced (`contract`
+  phase), retried once with every violation named in the feedback, and a
+  second violation **fails the run** — contracts are hard requirements, so
+  there is no `else` edge here.
+- Violations fold into `contract_violations` in metrics, the dashboard, and
+  the probe report — probe a program before and after adding a contract and
+  the stability delta is a number.
+- A `one_of` contract is a closed-enum call and reuses the `route` client
+  protocol, so it runs under `--dry-run` deterministically (first value):
+
+```bash
+threadlang examples/contract.thread --input change="rename a log field" --dry-run
+```
+
+Design notes: [`docs/design/phase-8-contracts.md`](docs/design/phase-8-contracts.md).
+
 ## Language
 
 ```
@@ -396,9 +436,10 @@ steps     — a forward-only DAG of llm / agent / route nodes     [yes]
   · agent — tool-use loop over an allow-listed tool registry    [v0.3]
   · route — enum-contracted decision; arms are the edges        [v0.9]
   · then -> <step|end> — explicit edge on llm/agent steps       [v0.9]
+  · expect — output contract on llm steps (one_of / matches
+    / max_chars / nonempty), enforced with feedback retry       [v0.11]
 emit text — string concatenation over expression terms          [yes]
 emit llm  — call a model with a rendered prompt                 [yes]
-rules     — general per-step output contracts                   [planned]
 ```
 
 Expression terms (joined with `+`):
@@ -482,6 +523,10 @@ The remaining layers each keep the determinism/trace bet:
    program repeatedly and folds the stored runs into per-step variance,
    route-label distributions, and violation/failure rates — reliability as a
    measurement, not a claim.
+9. **Contracts** *(v0.11, shipped)* — `expect { ... }` output contracts on
+   llm steps (one_of / matches / max_chars / nonempty), enforced with one
+   feedback retry and failing loud; violations are trace events that metrics
+   and probes fold.
 
 ## License
 

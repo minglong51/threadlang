@@ -39,8 +39,11 @@ program     = "thread" name "{" context [ steps ] emit "}"
 context     = "context" "{" { name "=" string } "}"
 steps       = "steps" "{" { step } "}"
 step        = "step" name "{" ( llm_body | agent_body | route_body ) "}"
-llm_body    = "llm" string "{" expression [ then ] "}"
+llm_body    = "llm" string "{" expression [ expect ] [ then ] "}"
 agent_body  = "agent" string "{" [ tools ] [ max_iters ] expression [ then ] "}"
+expect      = "expect" "{" rule { rule } "}"
+rule        = "one_of" string { "," string } | "matches" string
+            | "max_chars" number | "nonempty"
 route_body  = "route" string "{" expression arm { arm } [ "else" "->" target ] "}"
 arm         = "on" string "->" target
 then        = "then" "->" target
@@ -87,6 +90,35 @@ is deterministic code.
 `steps.<name>.output?` (optional reference) renders as `""` when the step
 was skipped by routing — how emit or a join step reads branch outputs.
 The non-optional form on a skipped step fails the run.
+
+### Output contracts (v0.11)
+
+An `llm` body may carry an `expect { ... }` block — a conjunction of rules
+its reply must satisfy, one per line:
+
+- `one_of "a", "b"` — the reply must be one of the listed values, matched
+  with the same normalization as route labels (whitespace/quote trim,
+  case-insensitive); the canonical value is what gets bound.
+- `matches "<regex>"` — the whole reply must match the pattern
+  (`re.fullmatch`); may appear more than once.
+- `max_chars N` — reply length cap.
+- `nonempty` — the reply must contain non-whitespace text.
+
+The rendered contract is appended to the prompt, so the contract the
+runtime enforces is the contract the model was shown. With any `expect`
+present the bound output is whitespace-stripped. A violating reply is
+traced (`contract` phase), retried once with each violation named in the
+feedback, and a second violation fails the run — contracts are hard
+requirements; there is no `else` edge for llm steps. Rules are validated
+at parse time (regexes compile, `max_chars >= 1`, no duplicate values or
+rule kinds — `matches` excepted).
+
+A step whose contract includes `one_of` is a closed-enum call and is
+dispatched through the client's optional `route(model, prompt, options)`
+protocol when present — the dry-run client answers with the first value,
+keeping contracted programs runnable offline. `expect` is only valid on
+`llm` bodies: a route step's contract is its arms, and an agent step's
+final answer is shaped by its tool loop.
 
 ## Runtime behavior
 
