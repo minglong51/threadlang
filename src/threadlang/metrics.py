@@ -57,11 +57,13 @@ class RunMetrics:
     steps_completed: int
     agent_steps: int
     agent_turns: int
-    model_calls: int  # complete() + agent_step() model invocations
+    model_calls: int  # complete() + agent_step() + route model invocations
     tool_calls: int
     tool_errors: int
     denials: int
     resumed_steps: int
+    route_steps: int  # routing decisions taken (one per executed route step)
+    route_violations: int  # route replies rejected by the output contract
     status: Optional[str]
 
     # ── observational: depend on wall-clock / the model (not reproducible) ──
@@ -91,6 +93,8 @@ class RunMetrics:
                 "tool_errors": self.tool_errors,
                 "denials": self.denials,
                 "resumed_steps": self.resumed_steps,
+                "route_steps": self.route_steps,
+                "route_violations": self.route_violations,
                 "status": self.status,
             },
             "observational": {
@@ -120,6 +124,8 @@ def compute_metrics(
     tool_errors = 0
     denials = 0
     resumed_steps = 0
+    route_steps = 0
+    route_violations = 0
     completed_steps: set = set()
     in_tok = 0
     out_tok = 0
@@ -150,6 +156,17 @@ def compute_metrics(
                     tool_errors += 1
             elif message.endswith("finished"):
                 completed_steps.add(data.get("step"))
+        elif phase == "route":
+            if message.startswith("Calling LLM for route step"):
+                llm_calls += 1
+            elif "output rejected" in message:
+                route_violations += 1
+            elif " chose " in message:
+                route_steps += 1
+                completed_steps.add(data.get("step"))
+            elif "resumed from checkpoint" in message:
+                resumed_steps += 1
+                completed_steps.add(data.get("step"))
         elif phase == "denial":
             denials += 1
         elif phase == "emit" and message == "Calling LLM for emit":
@@ -171,6 +188,8 @@ def compute_metrics(
         tool_errors=tool_errors,
         denials=denials,
         resumed_steps=resumed_steps,
+        route_steps=route_steps,
+        route_violations=route_violations,
         status=status,
         duration_ms=duration_ms,
         input_tokens=in_tok if saw_usage else None,

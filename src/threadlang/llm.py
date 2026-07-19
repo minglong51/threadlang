@@ -70,6 +70,16 @@ class AgentLLMClient(Protocol):
     ) -> AgentTurn: ...
 
 
+class RouteLLMClient(Protocol):
+    """Optional protocol for `route` steps. A client exposing `route` answers a
+    routing prompt knowing the closed set of admissible labels; clients without
+    it are called through plain `complete` (the prompt already carries the
+    output contract). The runtime detects it with `getattr`, like
+    `agent_step`."""
+
+    def route(self, model: str, prompt: str, options: Sequence[str]) -> str: ...
+
+
 class LLMError(RuntimeError):
     """Raised when an LLM call fails."""
 
@@ -95,6 +105,11 @@ class DryRunClient:
 
     def complete(self, model: str, prompt: str) -> str:
         return f"[dry-run:{model}] {prompt}"
+
+    def route(self, model: str, prompt: str, options: Sequence[str]) -> str:
+        """Deterministically pick the first arm label, so routed programs run
+        end-to-end under --dry-run just like agent loops do."""
+        return options[0] if options else ""
 
     def agent_step(
         self, model: str, messages: Sequence[Message], tools: Sequence[ToolSpec]

@@ -8,6 +8,7 @@ from .llm import (
     LLMClient,
     LLMError,
     OpenAICompatClient,
+    RouteLLMClient,
     ToolCall,
 )
 from .control import WorkerPool, process_one
@@ -48,6 +49,7 @@ __all__ = [
     "trace_span_ms",
     "LLMClient",
     "AgentLLMClient",
+    "RouteLLMClient",
     "AnthropicClient",
     "OpenAICompatClient",
     "DryRunClient",

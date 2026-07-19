@@ -3,6 +3,10 @@
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Union
 
+# Reserved jump target: `-> end` skips the remaining steps and goes to emit.
+# No step may be named `end`.
+END_TARGET = "end"
+
 
 @dataclass(frozen=True)
 class ContextAssignment:
@@ -32,9 +36,15 @@ class InputsRef:
 
 @dataclass(frozen=True)
 class StepsRef:
-    """Reference to a prior step's output: `steps.<step_name>.output`."""
+    """Reference to a prior step's output: `steps.<step_name>.output`.
+
+    `optional=True` (written `steps.<step_name>.output?`) renders as the empty
+    string when the step was skipped by routing, instead of failing the run —
+    how a join/emit reads outputs from branches that may not have executed.
+    """
 
     step_name: str
+    optional: bool = False
 
 
 ExpressionTerm = Union[StringLiteral, ContextRef, InputsRef, StepsRef]
@@ -51,11 +61,15 @@ class Step:
 
     Renders its prompt once, calls the model, binds the response to
     `steps.<name>.output`. No tools, no loop — deterministic chaining.
+
+    `next_target` (`then -> <step|end>` in source) is the step's outgoing
+    edge; None means fall through to the next declared step.
     """
 
     name: str
     model: str
     prompt: Expression
+    next_target: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -66,6 +80,9 @@ class AgentStep:
     (model → tool calls → observations → model) up to `max_iters` turns. The
     model may only call tools named in `tools`. The final text is bound to
     `steps.<name>.output`.
+
+    `next_target` (`then -> <step|end>` in source) is the step's outgoing
+    edge; None means fall through to the next declared step.
     """
 
     name: str
@@ -73,9 +90,37 @@ class AgentStep:
     prompt: Expression
     tools: Tuple[str, ...] = ()
     max_iters: int = 6
+    next_target: Optional[str] = None
 
 
-StepNode = Union[Step, AgentStep]
+@dataclass(frozen=True)
+class RouteArm:
+    """One conditional edge of a route step: `on "<label>" -> <target>`."""
+
+    label: str
+    target: str
+
+
+@dataclass(frozen=True)
+class RouteStep:
+    """A routing decision: `route "<model>" { <prompt> on "<label>" -> <step> ... }`.
+
+    The model call carries an output contract: it must reply with exactly one
+    of the arm labels. The chosen label is bound to `steps.<name>.output` and
+    execution jumps to that arm's target. A reply matching no label is retried
+    once with the violation fed back; if still unmatched, execution takes
+    `else_target` when present, otherwise the run fails. Arm dispatch itself
+    is deterministic — the model only picks the label.
+    """
+
+    name: str
+    model: str
+    prompt: Expression
+    arms: Tuple[RouteArm, ...] = ()
+    else_target: Optional[str] = None
+
+
+StepNode = Union[Step, AgentStep, RouteStep]
 
 
 @dataclass(frozen=True)
