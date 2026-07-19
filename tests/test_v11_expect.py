@@ -215,6 +215,18 @@ def test_max_chars_and_matches_enforced_on_stripped_reply() -> None:
     assert result.step_outputs["summary"] == "Good summary."
 
 
+def test_one_of_canonicalizes_before_other_rules_regardless_of_order() -> None:
+    source = VERDICT_SOURCE.replace(
+        'one_of "ship", "hold"',
+        'matches "ship|hold"\n          max_chars 4\n          one_of "ship", "hold"',
+    )
+    program = parse_program(source)
+    client = ScriptedClient([' "Ship". '])
+    result = run_program(program, {"change": "x"}, llm_client=client)
+    assert result.output == "ship"
+    assert compute_metrics(result.trace, status="completed").contract_violations == 0
+
+
 def test_dry_run_resolves_one_of_via_route_protocol() -> None:
     program = parse_program(VERDICT_SOURCE)
     result = run_program(program, {"change": "x"}, llm_client=DryRunClient())

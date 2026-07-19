@@ -99,14 +99,16 @@ its reply must satisfy, one per line:
 - `one_of "a", "b"` — the reply must be one of the listed values, matched
   with the same normalization as route labels (whitespace/quote trim,
   case-insensitive); the canonical value is what gets bound.
-- `matches "<regex>"` — the whole reply must match the pattern
+- `matches "<regex>"` — the whole bound output must match the pattern
   (`re.fullmatch`); may appear more than once.
 - `max_chars N` — reply length cap.
 - `nonempty` — the reply must contain non-whitespace text.
 
 The rendered contract is appended to the prompt, so the contract the
 runtime enforces is the contract the model was shown. With any `expect`
-present the bound output is whitespace-stripped. A violating reply is
+present the bound output is whitespace-stripped. `one_of` is applied
+first regardless of declaration order, so the other rules validate the
+output that will actually be bound. A violating reply is
 traced (`contract` phase), retried once with each violation named in the
 feedback, and a second violation fails the run — contracts are hard
 requirements; there is no `else` edge for llm steps. Rules are validated

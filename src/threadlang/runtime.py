@@ -234,20 +234,25 @@ def _check_expect(
     """Evaluate a reply against an expect contract. Returns (output,
     violations): the output a passing reply binds — whitespace-stripped, and
     canonicalized to the matching value for `one_of` (same normalization as
-    route labels) — plus a human-readable line per violated rule."""
+    route labels) — plus a human-readable line per violated rule.
+
+    `one_of` is applied first regardless of where it appears in the block, so
+    the remaining rules always validate the output that will be bound —
+    declaration order never changes what the contract accepts."""
     output = response.strip()
     violations: list[str] = []
+    one_of = next((r for r in rules if r.kind == "one_of"), None)
+    if one_of is not None:
+        by_normalized = {v.casefold(): v for v in one_of.values}
+        cleaned = output.strip("\"'`.,:;!").strip().casefold()
+        canonical = by_normalized.get(cleaned)
+        if canonical is None:
+            violations.append("reply is not one of: " + ", ".join(one_of.values))
+        else:
+            output = canonical
     for rule in rules:
         if rule.kind == "one_of":
-            by_normalized = {v.casefold(): v for v in rule.values}
-            cleaned = output.strip("\"'`.,:;!").strip().casefold()
-            canonical = by_normalized.get(cleaned)
-            if canonical is None:
-                violations.append(
-                    "reply is not one of: " + ", ".join(rule.values)
-                )
-            else:
-                output = canonical
+            pass
         elif rule.kind == "matches":
             assert rule.pattern is not None
             if re.fullmatch(rule.pattern, output) is None:
