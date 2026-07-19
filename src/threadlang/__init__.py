@@ -21,6 +21,7 @@ from .metrics import (
     trace_span_ms,
 )
 from .parser import ParseError, parse_program
+from .probe import ProbeReport, ProbeRunData, StepProbe, probe_report
 from .runtime import RuntimeError, RuntimeResult, run_program
 from .server import make_server, serve
 from .store import DurableRun, RunRecord, RunStore, run_durable
@@ -47,6 +48,10 @@ __all__ = [
     "compute_metrics",
     "aggregate",
     "trace_span_ms",
+    "ProbeReport",
+    "ProbeRunData",
+    "StepProbe",
+    "probe_report",
     "LLMClient",
     "AgentLLMClient",
     "RouteLLMClient",

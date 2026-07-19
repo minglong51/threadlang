@@ -9,6 +9,7 @@ from typing import Dict, List
 from .llm import AnthropicClient, DryRunClient, LLMClient, LLMError, OpenAICompatClient
 from .metrics import compute_metrics
 from .parser import parse_program
+from .probe import ProbeRunData, probe_report
 from .runtime import RuntimeError as TLRuntimeError, RuntimeResult, run_program
 from .store import RunStore, run_durable
 
@@ -68,6 +69,16 @@ def main() -> int:
         "Requires --store.",
     )
     parser.add_argument(
+        "--probe",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Controllability probe: run the program N times, persist every run "
+        "to --store, and print a stability report (per-step variance, route-label "
+        "distribution, violation and failure rates) as JSON. Requires --store; "
+        "failed runs are counted as data, not errors.",
+    )
+    parser.add_argument(
         "--trace",
         action="store_true",
         help="Print structured trace events to stderr after the output.",
@@ -85,6 +96,19 @@ def main() -> int:
     if args.resume and not args.store:
         print("error: --resume requires --store", file=sys.stderr)
         return 2
+    if args.probe is not None:
+        if args.probe < 1:
+            print("error: --probe N must be >= 1", file=sys.stderr)
+            return 2
+        if not args.store:
+            print(
+                "error: --probe requires --store (the report is a fold over the persisted runs)",
+                file=sys.stderr,
+            )
+            return 2
+        if args.resume:
+            print("error: --probe and --resume are incompatible", file=sys.stderr)
+            return 2
 
     try:
         return _run(args)
@@ -121,6 +145,8 @@ def _run(args: argparse.Namespace) -> int:
     import sys
 
     inputs = _parse_inputs(args.input)
+    if args.probe is not None:
+        return _probe(args, program, inputs, client)
     result: RuntimeResult
     if args.store:
         store = RunStore(args.store)
@@ -167,6 +193,39 @@ def _run(args: argparse.Namespace) -> int:
         import json
 
         print(json.dumps(run_metrics.to_dict(), indent=2), file=sys.stderr)
+    return 0
+
+
+def _probe(args: argparse.Namespace, program, inputs: Dict[str, str], client: LLMClient) -> int:
+    """Run the program N times durably and print the stability report. Every
+    run — failures included — is an ordinary persisted run, visible on the
+    dashboard and recomputable later; the report is a pure fold over them."""
+    import json
+    import sys
+
+    store = RunStore(args.store)
+    runs = []
+    for i in range(args.probe):
+        run_id = store.create_run(program.thread_name, inputs)
+        print(f"probe run {i + 1}/{args.probe}: {run_id}", file=sys.stderr)
+        try:
+            run_durable(program, inputs, store, llm_client=client, run_id=run_id)
+        except (LLMError, TLRuntimeError) as exc:
+            print(f"  failed: {exc}", file=sys.stderr)
+        record = store.get_run(run_id)
+        metrics = store.run_metrics(run_id)
+        assert record is not None and metrics is not None
+        runs.append(
+            ProbeRunData(
+                status=record.status,
+                output=record.output,
+                step_outputs=store.load_step_outputs(run_id),
+                metrics=metrics,
+            )
+        )
+    report = probe_report(program, runs)
+    store.close()
+    print(json.dumps(report.to_dict(), indent=2))
     return 0
 
 
