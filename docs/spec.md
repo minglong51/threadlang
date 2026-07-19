@@ -19,9 +19,11 @@ every phase.
 
 - Loops.
 - Recursion.
-- Branching / conditionals.
+- Branching / conditionals. *(Since v0.9: forward-only routing — see below.
+  Cyclic control flow remains out.)*
 - Streaming output.
-- Tool use / function calling.
+- Tool use / function calling. *(Since v0.3: `agent` steps run a tool-use
+  loop over an allow-listed registry.)*
 - System prompts (LLM calls send a single user-role message).
 - Advanced type system (terms are strings, period).
 
@@ -36,11 +38,18 @@ extension.
 program     = "thread" name "{" context [ steps ] emit "}"
 context     = "context" "{" { name "=" string } "}"
 steps       = "steps" "{" { step } "}"
-step        = "step" name "{" "llm" string "{" expression "}" "}"
+step        = "step" name "{" ( llm_body | agent_body | route_body ) "}"
+llm_body    = "llm" string "{" expression [ then ] "}"
+agent_body  = "agent" string "{" [ tools ] [ max_iters ] expression [ then ] "}"
+route_body  = "route" string "{" expression arm { arm } [ "else" "->" target ] "}"
+arm         = "on" string "->" target
+then        = "then" "->" target
+target      = name | "end"
 emit_text   = "emit" "text" "{" expression "}"
 emit_llm    = "emit" "llm" string "{" expression "}"
 expression  = term { "+" term }
-term        = string | "context." name | "inputs." name | "steps." name ".output"
+term        = string | "context." name | "inputs." name
+            | "steps." name ".output" [ "?" ]
 ```
 
 - `context` block: name → string-literal map. Required.
@@ -49,7 +58,35 @@ term        = string | "context." name | "inputs." name | "steps." name ".output
 - `emit` block: required. Either `emit text` (string concatenation over
   expression terms) or `emit llm "<model>" { ... }` (rendered prompt sent
   to the model; response becomes the program output).
-- Step names within a single `steps` block must be unique.
+- Step names within a single `steps` block must be unique. `end` is a
+  reserved jump target and cannot be a step name.
+
+### Step graph (v0.9)
+
+Steps form a **forward-only DAG**. Every step has an outgoing edge:
+
+- default — fall through to the next declared step;
+- `then -> <step|end>` on an `llm`/`agent` body — an explicit edge;
+- a `route` body's `on "<label>" -> <target>` arms — conditional edges,
+  picked by the model under an output contract (see below);
+- `end` — skip the remaining steps and go to emit.
+
+All targets must be declared *after* the step that jumps to them
+(parser-enforced), so every step runs at most once per run. This is what
+keeps step-name checkpoints, resume, and replay correct with routing.
+
+A `route` step calls its model with the rendered prompt plus a generated
+output contract ("Reply with exactly one of: ...") derived from its arm
+labels. The reply is normalized (whitespace/quote trim, case-insensitive)
+and must equal an arm label. A miss is traced as a rejection and retried
+once with the violation fed back; a second miss takes the `else ->` edge
+(binding the raw reply as the step output) or fails the run if there is
+none. The chosen label is bound to `steps.<name>.output`; the jump itself
+is deterministic code.
+
+`steps.<name>.output?` (optional reference) renders as `""` when the step
+was skipped by routing — how emit or a join step reads branch outputs.
+The non-optional form on a skipped step fails the run.
 
 ## Runtime behavior
 

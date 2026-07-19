@@ -5,11 +5,19 @@ Grammar (informal):
     program     = "thread" name "{" context [ steps ] emit "}"
     context     = "context" "{" { name "=" string } "}"
     steps       = "steps" "{" { step } "}"
-    step        = "step" name "{" "llm" string "{" expression "}" "}"
+    step        = "step" name "{" ( llm_body | agent_body | route_body ) "}"
+    route_body  = "route" string "{" expression arm { arm } [ "else" "->" name ] "}"
+    arm         = "on" string "->" ( name | "end" )
     emit_text   = "emit" "text" "{" expression "}"
     emit_llm    = "emit" "llm" string "{" expression "}"
     expression  = term { "+" term }
-    term        = string | "context." name | "inputs." name | "steps." name ".output"
+    term        = string | "context." name | "inputs." name | "steps." name ".output" [ "?" ]
+
+Steps form a forward-only DAG: an `llm`/`agent` body may end with
+`then -> <step|end>` (default: fall through to the next declared step), a
+`route` body's arms are its conditional edges, and every jump target must be
+declared *after* the step that jumps to it. `end` is a reserved target that
+skips to emit; no step may be named `end`.
 
 `steps` is optional. `emit` is required and is either `emit text` or
 `emit llm`. Whitespace is insignificant.
@@ -26,6 +34,7 @@ import re
 from typing import List
 
 from .ast import (
+    END_TARGET,
     AgentStep,
     ContextAssignment,
     ContextBlock,
@@ -34,6 +43,8 @@ from .ast import (
     Expression,
     InputsRef,
     Program,
+    RouteArm,
+    RouteStep,
     Step,
     StepNode,
     StepsBlock,
@@ -62,13 +73,17 @@ _STEPS_HEAD_RE = re.compile(r"\bsteps\s*\{")
 _STEP_HEAD_RE = re.compile(r"\bstep\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{")
 _LLM_BODY_RE = re.compile(r'\s*llm\s+"([^"]+)"\s*\{(.*)\}\s*', re.DOTALL)
 _AGENT_BODY_RE = re.compile(r'\s*agent\s+"([^"]+)"\s*\{(.*)\}\s*', re.DOTALL)
+_ROUTE_BODY_RE = re.compile(r'\s*route\s+"([^"]+)"\s*\{(.*)\}\s*', re.DOTALL)
 _TOOLS_RE = re.compile(r"\btools\s*\[([^\]]*)\]")
 _MAX_ITERS_RE = re.compile(r"\bmax_iters\s+(\d+)")
+_THEN_RE = re.compile(r"\bthen\s*->\s*([A-Za-z_][A-Za-z0-9_]*)")
+_ARM_RE = re.compile(r'\bon\s+"([^"]+)"\s*->\s*([A-Za-z_][A-Za-z0-9_]*)')
+_ELSE_RE = re.compile(r"\belse\s*->\s*([A-Za-z_][A-Za-z0-9_]*)")
 _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _EMIT_TEXT_RE = re.compile(r"emit\s+text\s*\{([^{}]*)\}", re.DOTALL)
 _EMIT_LLM_RE = re.compile(r"emit\s+llm\s+\"([^\"]+)\"\s*\{([^{}]*)\}", re.DOTALL)
 _CONTEXT_ASSIGN_RE = re.compile(r'([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"([^"]*)"')
-_STEPS_REF_RE = re.compile(r"steps\.([A-Za-z_][A-Za-z0-9_]*)\.output")
+_STEPS_REF_RE = re.compile(r"steps\.([A-Za-z_][A-Za-z0-9_]*)\.output(\??)")
 
 
 def parse_program(source: str) -> Program:
@@ -142,6 +157,10 @@ def _parse_steps_block(body: str) -> StepsBlock:
             break
         name = step_head.group(1)
         step_body, close_index = _extract_braced(steps_body, step_head.end() - 1)
+        if name == END_TARGET:
+            raise ParseError(
+                f"'{END_TARGET}' is a reserved jump target and cannot be a step name"
+            )
         if name in seen_names:
             raise ParseError(f"Duplicate step name: {name}")
         seen_names.add(name)
@@ -153,38 +172,132 @@ def _parse_steps_block(body: str) -> StepsBlock:
     if not steps and steps_body.strip():
         raise ParseError(
             "steps block present but no valid step found. "
-            'Expected: step <name> { llm "<model>" { <expression> } } '
-            'or step <name> { agent "<model>" { ... } }'
+            'Expected: step <name> { llm "<model>" { <expression> } }, '
+            'step <name> { agent "<model>" { ... } }, '
+            'or step <name> { route "<model>" { ... } }'
         )
 
+    _validate_targets(steps)
     return StepsBlock(steps=steps)
+
+
+def _validate_targets(steps: List[StepNode]) -> None:
+    """Every jump target must be a step declared *after* the jumping step, or
+    the reserved `end`. Forward-only edges keep the step graph a DAG — each
+    step runs at most once, which is what makes step-name checkpoints and
+    resume-from-failure stay correct with routing in the language."""
+    index = {step.name: i for i, step in enumerate(steps)}
+
+    def check(origin: str, position: int, target: str, kind: str) -> None:
+        if target == END_TARGET:
+            return
+        if target not in index:
+            raise ParseError(f"step '{origin}': {kind} -> unknown step '{target}'")
+        if index[target] <= position:
+            raise ParseError(
+                f"step '{origin}': {kind} -> '{target}' jumps backward; "
+                "targets must be declared after the step that jumps to them"
+            )
+
+    for i, step in enumerate(steps):
+        if isinstance(step, RouteStep):
+            seen_labels: set[str] = set()
+            for arm in step.arms:
+                if arm.label in seen_labels:
+                    raise ParseError(
+                        f"step '{step.name}': duplicate route label \"{arm.label}\""
+                    )
+                seen_labels.add(arm.label)
+                check(step.name, i, arm.target, f'on "{arm.label}"')
+            if step.else_target is not None:
+                check(step.name, i, step.else_target, "else")
+        elif step.next_target is not None:
+            check(step.name, i, step.next_target, "then")
 
 
 def _join_expression_text(raw: str) -> str:
     return " ".join(line.strip() for line in raw.splitlines() if line.strip()).strip()
 
 
+def _parse_then(name: str, inner: str) -> tuple[str, str | None]:
+    """Extract an optional `then -> <target>` edge from a step body, returning
+    (remaining_body, target)."""
+    then_match = _THEN_RE.search(inner)
+    if not then_match:
+        return inner, None
+    target = then_match.group(1)
+    inner = inner[: then_match.start()] + inner[then_match.end() :]
+    if _THEN_RE.search(inner):
+        raise ParseError(f"step '{name}': multiple then -> edges")
+    return inner, target
+
+
 def _parse_step_body(name: str, step_body: str) -> StepNode:
     llm_match = _LLM_BODY_RE.fullmatch(step_body)
     if llm_match:
         model = llm_match.group(1)
-        expression_text = _join_expression_text(llm_match.group(2))
+        inner, next_target = _parse_then(name, llm_match.group(2))
+        expression_text = _join_expression_text(inner)
         if not expression_text:
             raise ParseError(f"step '{name}': llm body must include a prompt expression")
-        return Step(name=name, model=model, prompt=_parse_expression(expression_text))
+        return Step(
+            name=name,
+            model=model,
+            prompt=_parse_expression(expression_text),
+            next_target=next_target,
+        )
 
     agent_match = _AGENT_BODY_RE.fullmatch(step_body)
     if agent_match:
         return _parse_agent_step(name, agent_match.group(1), agent_match.group(2))
 
+    route_match = _ROUTE_BODY_RE.fullmatch(step_body)
+    if route_match:
+        return _parse_route_step(name, route_match.group(1), route_match.group(2))
+
     raise ParseError(
-        f"step '{name}': body must be llm \"<model>\" {{ ... }} or agent \"<model>\" {{ ... }}"
+        f"step '{name}': body must be llm \"<model>\" {{ ... }}, "
+        f"agent \"<model>\" {{ ... }}, or route \"<model>\" {{ ... }}"
+    )
+
+
+def _parse_route_step(name: str, model: str, inner: str) -> RouteStep:
+    """Parse a route body: a prompt expression, one or more `on "<label>" ->
+    <target>` arms, and an optional `else -> <target>`."""
+    arms: List[RouteArm] = []
+    for arm_match in _ARM_RE.finditer(inner):
+        arms.append(RouteArm(label=arm_match.group(1), target=arm_match.group(2)))
+    inner = _ARM_RE.sub("", inner)
+    if not arms:
+        raise ParseError(
+            f"route '{name}': needs at least one arm: on \"<label>\" -> <step|end>"
+        )
+
+    else_target: str | None = None
+    else_match = _ELSE_RE.search(inner)
+    if else_match:
+        else_target = else_match.group(1)
+        inner = inner[: else_match.start()] + inner[else_match.end() :]
+        if _ELSE_RE.search(inner):
+            raise ParseError(f"route '{name}': multiple else -> edges")
+
+    expression_text = _join_expression_text(inner)
+    if not expression_text:
+        raise ParseError(f"route '{name}': missing prompt expression")
+    return RouteStep(
+        name=name,
+        model=model,
+        prompt=_parse_expression(expression_text),
+        arms=tuple(arms),
+        else_target=else_target,
     )
 
 
 def _parse_agent_step(name: str, model: str, inner: str) -> AgentStep:
-    """Parse an agent body: optional `tools [...]`, optional `max_iters N`, and
-    a prompt expression (everything left over)."""
+    """Parse an agent body: optional `tools [...]`, optional `max_iters N`,
+    optional `then -> <target>`, and a prompt expression (everything left
+    over)."""
+    inner, next_target = _parse_then(name, inner)
     tools: tuple[str, ...] = ()
     tools_match = _TOOLS_RE.search(inner)
     if tools_match:
@@ -212,6 +325,7 @@ def _parse_agent_step(name: str, model: str, inner: str) -> AgentStep:
         prompt=_parse_expression(expression_text),
         tools=tools,
         max_iters=max_iters,
+        next_target=next_target,
     )
 
 
@@ -259,7 +373,12 @@ def _parse_expression(expression_text: str) -> Expression:
         elif re.fullmatch(r"inputs\.[A-Za-z_][A-Za-z0-9_]*", term):
             parsed_terms.append(InputsRef(name=term.split(".", 1)[1]))
         elif (steps_match := _STEPS_REF_RE.fullmatch(term)) is not None:
-            parsed_terms.append(StepsRef(step_name=steps_match.group(1)))
+            parsed_terms.append(
+                StepsRef(
+                    step_name=steps_match.group(1),
+                    optional=steps_match.group(2) == "?",
+                )
+            )
         else:
             raise ParseError(f"Unsupported expression term: {term}")
 

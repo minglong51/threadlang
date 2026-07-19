@@ -22,7 +22,11 @@ ticket, searches a knowledge base, and drafts a reply — durable, queued, and
 inspectable like any other run. As of **v0.8** every run has
 [**metrics**](#metrics-v08) — a deterministic-vs-observational view *derived
 from* the trace (`GET /metrics`), so monitoring and data-driven iteration read
-the same events the timeline does. Build plans: [`docs/design/`](docs/design/).
+the same events the timeline does. As of **v0.9** programs are
+[**node graphs**](#routing-v09), not just pipelines: a `route` step makes an
+enum-contracted model decision and deterministic code dispatches the jump —
+forward-only, so checkpoints, resume, and replay survive branching unchanged.
+Build plans: [`docs/design/`](docs/design/).
 
 ```thread
 thread TwoStep {
@@ -301,16 +305,56 @@ requires it hold no mutable per-call state, so usage will ride a future
 return-shape change rather than client-side state — the fold already reads
 `data.usage` the moment it appears.
 
+## Routing (v0.9)
+
+A `route` step turns the step list into a **node graph**: the model makes one
+bounded decision — which arm label fits — and deterministic code does the jump.
+The output contract ("reply with exactly one of: ...") is generated from the
+arms; a non-matching reply is traced as a violation and retried once with the
+violation fed back, then falls to `else ->` or fails loud.
+
+```thread
+step classify {
+  route "deepseek-chat" {
+    "Decide how to handle this request: " + inputs.task
+    on "math" -> solve_math
+    on "writing" -> draft
+    else -> draft
+  }
+}
+```
+
+- Any step can end with `then -> <step|end>`; default is fall-through, so
+  existing programs are untouched. `end` skips to emit.
+- The graph is a **forward-only DAG** (targets must be declared later), so
+  every step runs at most once — checkpoints, resume, and replay work
+  unchanged. A resumed route re-derives its jump from the stored label with
+  no model call.
+- `steps.<name>.output?` renders as `""` when routing skipped the step — how
+  emit or a join step reads branch outputs. The non-`?` form fails loud.
+- The routing decision, each rejection, and the chosen edge are `route`-phase
+  `TraceEvent`s; metrics gain `route_steps` / `route_violations` and the
+  dashboard shows both.
+- Runs under `--dry-run` (first arm chosen deterministically):
+
+```bash
+threadlang examples/route.thread --input task="what is 21*2?" --dry-run --trace
+```
+
+Design notes: [`docs/design/phase-6-routing.md`](docs/design/phase-6-routing.md).
+
 ## Language
 
 ```
 context   — deterministic values available during execution     [yes]
-steps     — ordered transformations: llm or agent               [yes]
+steps     — a forward-only DAG of llm / agent / route nodes     [yes]
   · llm   — call a model with a rendered prompt                 [yes]
   · agent — tool-use loop over an allow-listed tool registry    [v0.3]
+  · route — enum-contracted decision; arms are the edges        [v0.9]
+  · then -> <step|end> — explicit edge on llm/agent steps       [v0.9]
 emit text — string concatenation over expression terms          [yes]
 emit llm  — call a model with a rendered prompt                 [yes]
-rules     — constraints and invariants                          [planned]
+rules     — general per-step output contracts                   [planned]
 ```
 
 Expression terms (joined with `+`):
@@ -318,16 +362,18 @@ Expression terms (joined with `+`):
 - string literal: `"hello"`
 - context value: `context.<name>`
 - input value: `inputs.<name>`
-- prior step output: `steps.<step_name>.output`
+- prior step output: `steps.<step_name>.output` (append `?` to render `""`
+  instead of failing when routing skipped the step)
 
 Full grammar in [`docs/grammar.ebnf`](docs/grammar.ebnf); semantics in
 [`docs/spec.md`](docs/spec.md).
 
 ## What this deliberately does not have yet
 
-Still narrow on purpose: no branching/recursion, no streaming, no system
-prompts, no real type system, and tools are pure functions with no sandbox or
-resource limits. Each is a real addition with its own design surface, sequenced
+Still narrow on purpose: no cycles/recursion (branching is forward-only —
+iteration lives inside `agent` steps, bounded by `max_iters`), no streaming,
+no system prompts, no real type system, and tools are pure functions with no
+sandbox or resource limits. Each is a real addition with its own design surface, sequenced
 behind the platform layers below rather than bolted on early.
 
 ## Project shape
@@ -385,6 +431,9 @@ The remaining layers each keep the determinism/trace bet:
    *derived* from the persisted trace (`metrics.py`), surfaced per-run and as an
    aggregate rollup on the dashboard and `GET /metrics`. The substrate a
    data-driven self-improvement loop reads.
+7. **Routing** *(v0.9, shipped)* — programs become forward-only node graphs:
+   `route` steps make enum-contracted decisions, deterministic code dispatches
+   the edges, and checkpoints/resume/replay survive branching unchanged.
 
 ## License
 

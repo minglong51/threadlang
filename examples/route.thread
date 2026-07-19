@@ -1,0 +1,35 @@
+thread RouteDemo {
+  context {
+    persona = "a concise assistant"
+  }
+
+  steps {
+    step classify {
+      route "deepseek-chat" {
+        "Decide how to handle this request: " + inputs.task
+        on "math" -> solve_math
+        on "writing" -> draft
+        else -> draft
+      }
+    }
+
+    step solve_math {
+      agent "deepseek-chat" {
+        tools [ echo, calculator ]
+        max_iters 4
+        "You are " + context.persona + ". Solve the problem, showing the result. Task: " + inputs.task
+        then -> end
+      }
+    }
+
+    step draft {
+      llm "deepseek-chat" {
+        "You are " + context.persona + ". Write a short response. Task: " + inputs.task
+      }
+    }
+  }
+
+  emit text {
+    steps.solve_math.output? + steps.draft.output?
+  }
+}

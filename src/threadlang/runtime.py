@@ -2,10 +2,13 @@
 
 Execution order:
     1. Build context from context block (deterministic).
-    2. Run each step in declaration order. Each step renders its prompt by
-       evaluating expression terms against (context, inputs, prior step
-       outputs), calls the LLM client with (model, prompt), and binds the
-       response to `steps.<name>.output`.
+    2. Traverse the step graph starting at the first declared step. Each step
+       renders its prompt by evaluating expression terms against (context,
+       inputs, prior step outputs), calls the LLM client with (model, prompt),
+       and binds the response to `steps.<name>.output`. The next step is the
+       current step's outgoing edge: a `route` step's chosen arm, a `then ->`
+       target, or fall-through to the next declared step. Edges are forward-
+       only (parser-enforced), so every step runs at most once.
     3. Evaluate the emit block:
        - emit text → string concat of expression terms.
        - emit llm  → render the prompt as above, call the LLM client one
@@ -22,12 +25,14 @@ from dataclasses import dataclass
 from typing import Callable, Dict, Mapping, Optional
 
 from .ast import (
+    END_TARGET,
     AgentStep,
     ContextRef,
     EmitBlock,
     Expression,
     InputsRef,
     Program,
+    RouteStep,
     Step,
     StepsRef,
     StringLiteral,
@@ -120,31 +125,81 @@ def _run_steps(
     resume_outputs: Optional[Mapping[str, str]] = None,
     on_step_complete: Optional[Callable[[str, str], None]] = None,
 ) -> Dict[str, str]:
+    steps = program.steps.steps
+    index_by_name = {step.name: i for i, step in enumerate(steps)}
     step_outputs: Dict[str, str] = {}
-    for step in program.steps.steps:
-        if resume_outputs is not None and step.name in resume_outputs:
+    i = 0
+    while i < len(steps):
+        step = steps[i]
+        resumed = resume_outputs is not None and step.name in resume_outputs
+        if resumed:
             # This step finished in a prior attempt and was checkpointed; reuse
             # its output instead of re-running it. The skip is itself traced.
+            # A resumed route step re-derives its jump from the stored label
+            # below — deterministically, with no model call.
             output = resume_outputs[step.name]
             trace.append(
                 TraceEvent(
-                    phase="step",
+                    phase="route" if isinstance(step, RouteStep) else "step",
                     message=f"Step '{step.name}' resumed from checkpoint",
                     data={"step": step.name, "output": output, "resumed": True},
                 )
             )
             step_outputs[step.name] = output
-            continue
-        if isinstance(step, AgentStep):
+        elif isinstance(step, RouteStep):
+            output = _run_route_step(step, context, inputs, step_outputs, client, trace)
+            step_outputs[step.name] = output
+        elif isinstance(step, AgentStep):
             output = _run_agent_step(
                 step, context, inputs, step_outputs, client, registry, trace
             )
+            step_outputs[step.name] = output
         else:
             output = _run_llm_step(step, context, inputs, step_outputs, client, trace)
-        step_outputs[step.name] = output
-        if on_step_complete is not None:
+            step_outputs[step.name] = output
+        if not resumed and on_step_complete is not None:
             on_step_complete(step.name, output)
+
+        # Follow the step's outgoing edge. Arm dispatch is deterministic code:
+        # the model only picked the label, the transition is decided here.
+        if isinstance(step, RouteStep):
+            target = _route_target(step, output)
+            if target is None:
+                raise RuntimeError(
+                    f"route step '{step.name}' produced '{output}', which matches "
+                    f"no arm, and no else -> edge is defined"
+                )
+            trace.append(
+                TraceEvent(
+                    phase="route",
+                    message=f"Route step '{step.name}' chose '{output}'",
+                    data={
+                        "step": step.name,
+                        "label": output,
+                        "target": target,
+                        "resumed": resumed,
+                    },
+                )
+            )
+        else:
+            target = step.next_target
+        if target is None:
+            i += 1
+        elif target == END_TARGET:
+            break
+        else:
+            i = index_by_name[target]
     return step_outputs
+
+
+def _route_target(step: RouteStep, label: str) -> Optional[str]:
+    """Resolve a route step's output to its jump target: the matching arm, or
+    `else_target` when no arm matches (a contract violation that exhausted its
+    retry stores the raw normalized reply as the step output)."""
+    for arm in step.arms:
+        if arm.label == label:
+            return arm.target
+    return step.else_target
 
 
 def _run_llm_step(
@@ -177,6 +232,97 @@ def _run_llm_step(
         )
     )
     return response
+
+
+def _normalize_route_output(response: str, labels: Mapping[str, str]) -> Optional[str]:
+    """Match a model reply against the arm labels: strip whitespace and
+    surrounding quote/punctuation noise, compare case-insensitively, return the
+    canonical label. Strict beyond that — no substring matching — so the output
+    contract stays a contract."""
+    cleaned = response.strip().strip("\"'`.,:;!").strip().casefold()
+    return labels.get(cleaned)
+
+
+def _run_route_step(
+    step: RouteStep,
+    context: Mapping[str, str],
+    inputs: Mapping[str, str],
+    step_outputs: Mapping[str, str],
+    client: LLMClient,
+    trace: Trace,
+) -> str:
+    """Run a route step's model call under its output contract: the reply must
+    be exactly one of the arm labels. The contract is rendered into the prompt
+    from the arms themselves. A non-matching reply is rejected (traced) and
+    retried once with the violation fed back; a second miss returns the
+    stripped raw reply, which the caller resolves through the `else ->` edge
+    or fails loud. A client exposing `.route(model, prompt, options)` is called
+    through it (the dry-run client picks the first arm deterministically);
+    otherwise the plain `complete` path is used."""
+    labels = [arm.label for arm in step.arms]
+    by_normalized = {label.casefold(): label for label in labels}
+    contract = (
+        "Reply with exactly one of: "
+        + ", ".join(labels)
+        + ". Output only the label — no other text."
+    )
+    prompt = _render_expression(step.prompt, context, inputs, step_outputs)
+    full_prompt = f"{prompt}\n\n{contract}"
+
+    route_fn = getattr(client, "route", None)
+
+    def ask(p: str, attempt: int) -> str:
+        trace.append(
+            TraceEvent(
+                phase="route",
+                message=f"Calling LLM for route step '{step.name}'",
+                data={
+                    "step": step.name,
+                    "model": step.model,
+                    "prompt": p,
+                    "labels": labels,
+                    "attempt": attempt,
+                },
+            )
+        )
+        try:
+            if route_fn is not None:
+                return route_fn(model=step.model, prompt=p, options=labels)
+            return client.complete(model=step.model, prompt=p)
+        except Exception as exc:
+            raise RuntimeError(
+                f"LLM call failed in route step '{step.name}': {type(exc).__name__}: {exc}"
+            ) from exc
+
+    response = ask(full_prompt, attempt=1)
+    label = _normalize_route_output(response, by_normalized)
+    if label is not None:
+        return label
+
+    trace.append(
+        TraceEvent(
+            phase="route",
+            message=f"Route step '{step.name}' output rejected",
+            data={"step": step.name, "response": response, "labels": labels, "attempt": 1},
+        )
+    )
+    retry_prompt = (
+        f"{full_prompt}\n\nYour previous reply was not one of the allowed labels. "
+        + contract
+    )
+    response = ask(retry_prompt, attempt=2)
+    label = _normalize_route_output(response, by_normalized)
+    if label is not None:
+        return label
+
+    trace.append(
+        TraceEvent(
+            phase="route",
+            message=f"Route step '{step.name}' output rejected",
+            data={"step": step.name, "response": response, "labels": labels, "attempt": 2},
+        )
+    )
+    return response.strip()
 
 
 def _run_agent_step(
@@ -361,11 +507,16 @@ def _render_expression(
             source = f"inputs.{term.name}"
         elif isinstance(term, StepsRef):
             if term.step_name not in step_outputs:
-                raise RuntimeError(
-                    f"Reference to step '{term.step_name}' before it ran"
-                )
-            value = step_outputs[term.step_name]
-            source = f"steps.{term.step_name}.output"
+                if not term.optional:
+                    raise RuntimeError(
+                        f"Reference to step '{term.step_name}' before it ran "
+                        f"(a step skipped by routing renders as \"\" only via "
+                        f"steps.{term.step_name}.output?)"
+                    )
+                value = ""
+            else:
+                value = step_outputs[term.step_name]
+            source = f"steps.{term.step_name}.output" + ("?" if term.optional else "")
         else:
             raise RuntimeError(f"Unsupported term type: {type(term)!r}")
 
