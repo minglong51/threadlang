@@ -26,6 +26,9 @@ the same events the timeline does. As of **v0.9** programs are
 [**node graphs**](#routing-v09), not just pipelines: a `route` step makes an
 enum-contracted model decision and deterministic code dispatches the jump —
 forward-only, so checkpoints, resume, and replay survive branching unchanged.
+As of **v0.10** reliability is a [**measurement**](#probes-v010): `--probe N`
+runs a program N times and folds the stored runs into per-step variance,
+route-label distributions, and violation/failure rates.
 Build plans: [`docs/design/`](docs/design/).
 
 ```thread
@@ -343,6 +346,47 @@ threadlang examples/route.thread --input task="what is 21*2?" --dry-run --trace
 
 Design notes: [`docs/design/phase-6-routing.md`](docs/design/phase-6-routing.md).
 
+## Probes (v0.10)
+
+A controllability probe turns "structure reduces variance" from a claim into a
+number: run the same program N times against a real backend, persist every run,
+and fold them into a stability report. Change a prompt, a contract, or a
+decomposition; re-probe; compare.
+
+```bash
+threadlang examples/route.thread --input task="what is 21*2?" \
+  --backend openai --store probes.db --probe 20
+```
+
+```json
+{
+  "runs": 20, "completed": 20, "failed": 0, "failure_rate": 0.0,
+  "route_violations": 1,
+  "steps": [
+    {"step": "classify", "kind": "route", "runs": 20, "distinct_outputs": 1,
+     "mode_frequency": 1.0, "label_counts": {"math": 20}},
+    {"step": "solve_math", "kind": "agent", "runs": 20, "distinct_outputs": 4,
+     "mode_frequency": 0.85}
+  ],
+  "output": {"distinct": 4, "mode_frequency": 0.85}
+}
+```
+
+- The report is a **pure fold over the persisted runs** (same doctrine as
+  metrics) — recomputable from the store, never a separately-reported number.
+  That's why `--probe` requires `--store`.
+- Every probe run is an ordinary durable run — dashboard-visible, with its own
+  trace. Failed runs are data (`failure_rate`), not errors.
+- `mode_frequency` = share of executions producing the most common output:
+  1.0 is perfectly stable (the `--dry-run` baseline), 1/runs is maximal
+  instability. Steps skipped by routing in every run report `runs: 0`, never
+  false stability. Route steps carry their full label histogram — their output
+  space is closed, so the distribution is the decision behavior.
+- Variance is exact-match only by design (no embeddings): honest and coarse for
+  freeform steps, exact for contracted ones.
+
+Design notes: [`docs/design/phase-7-probes.md`](docs/design/phase-7-probes.md).
+
 ## Language
 
 ```
@@ -434,6 +478,10 @@ The remaining layers each keep the determinism/trace bet:
 7. **Routing** *(v0.9, shipped)* — programs become forward-only node graphs:
    `route` steps make enum-contracted decisions, deterministic code dispatches
    the edges, and checkpoints/resume/replay survive branching unchanged.
+8. **Probes** *(v0.10, shipped)* — controllability probes: `--probe N` runs a
+   program repeatedly and folds the stored runs into per-step variance,
+   route-label distributions, and violation/failure rates — reliability as a
+   measurement, not a claim.
 
 ## License
 
