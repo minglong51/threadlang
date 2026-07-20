@@ -56,6 +56,22 @@ class Expression:
 
 
 @dataclass(frozen=True)
+class ExpectRule:
+    """One clause of an llm step's output contract (`expect { ... }`).
+
+    kind=one_of    → values holds the closed set of admissible replies.
+    kind=matches   → pattern holds a regex the reply must fullmatch.
+    kind=max_chars → limit holds the maximum reply length.
+    kind=nonempty  → the reply must contain non-whitespace text.
+    """
+
+    kind: str  # "one_of" | "matches" | "max_chars" | "nonempty"
+    values: Tuple[str, ...] = ()
+    pattern: Optional[str] = None
+    limit: Optional[int] = None
+
+
+@dataclass(frozen=True)
 class Step:
     """A single-shot LLM transformation: `llm "<model>" { <prompt> }`.
 
@@ -64,12 +80,17 @@ class Step:
 
     `next_target` (`then -> <step|end>` in source) is the step's outgoing
     edge; None means fall through to the next declared step.
+
+    `expect` is the step's output contract: every rule must hold for the
+    reply to be accepted. A violating reply is retried once with the
+    violations fed back; a second violation fails the run.
     """
 
     name: str
     model: str
     prompt: Expression
     next_target: Optional[str] = None
+    expect: Tuple[ExpectRule, ...] = ()
 
 
 @dataclass(frozen=True)

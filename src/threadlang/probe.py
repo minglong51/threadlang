@@ -83,6 +83,7 @@ class ProbeReport:
     failed: int
     failure_rate: Optional[float]  # None when runs == 0
     route_violations: int
+    contract_violations: int
     steps: List[StepProbe]
     output_distinct: int
     output_mode_frequency: Optional[float]  # None when no run completed
@@ -96,6 +97,7 @@ class ProbeReport:
             "failed": self.failed,
             "failure_rate": self.failure_rate,
             "route_violations": self.route_violations,
+            "contract_violations": self.contract_violations,
             "steps": [s.to_dict() for s in self.steps],
             "output": {
                 "distinct": self.output_distinct,
@@ -128,6 +130,7 @@ def probe_report(program: Program, runs: Sequence[ProbeRunData]) -> ProbeReport:
     completed = sum(1 for r in runs if r.status == "completed")
     failed = sum(1 for r in runs if r.status == "failed")
     route_violations = sum(r.metrics.route_violations for r in runs)
+    contract_violations = sum(r.metrics.contract_violations for r in runs)
 
     steps: List[StepProbe] = []
     for step in program.steps.steps:
@@ -160,6 +163,7 @@ def probe_report(program: Program, runs: Sequence[ProbeRunData]) -> ProbeReport:
         failed=failed,
         failure_rate=(failed / len(runs)) if runs else None,
         route_violations=route_violations,
+        contract_violations=contract_violations,
         steps=steps,
         output_distinct=len(final_outputs),
         output_mode_frequency=_mode_frequency(final_outputs),

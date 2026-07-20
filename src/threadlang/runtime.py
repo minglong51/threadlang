@@ -24,11 +24,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Dict, Mapping, Optional
 
+import re
+
 from .ast import (
     END_TARGET,
     AgentStep,
     ContextRef,
     EmitBlock,
+    ExpectRule,
     Expression,
     InputsRef,
     Program,
@@ -202,6 +205,70 @@ def _route_target(step: RouteStep, label: str) -> Optional[str]:
     return step.else_target
 
 
+def _contract_text(rules: tuple[ExpectRule, ...]) -> str:
+    """Render an expect contract into prompt instructions, the way a route
+    step renders its arm labels — the contract the runtime enforces is the
+    contract the model was shown."""
+    lines = []
+    for rule in rules:
+        if rule.kind == "one_of":
+            lines.append(
+                "Reply with exactly one of: "
+                + ", ".join(rule.values)
+                + ". Output only the label — no other text."
+            )
+        elif rule.kind == "matches":
+            lines.append(
+                f"Your entire reply must match this regular expression: {rule.pattern}"
+            )
+        elif rule.kind == "max_chars":
+            lines.append(f"Reply with at most {rule.limit} characters.")
+        elif rule.kind == "nonempty":
+            lines.append("Your reply must not be empty.")
+    return "\n".join(lines)
+
+
+def _check_expect(
+    rules: tuple[ExpectRule, ...], response: str
+) -> tuple[str, list[str]]:
+    """Evaluate a reply against an expect contract. Returns (output,
+    violations): the output a passing reply binds — whitespace-stripped, and
+    canonicalized to the matching value for `one_of` (same normalization as
+    route labels) — plus a human-readable line per violated rule.
+
+    `one_of` is applied first regardless of where it appears in the block, so
+    the remaining rules always validate the output that will be bound —
+    declaration order never changes what the contract accepts."""
+    output = response.strip()
+    violations: list[str] = []
+    one_of = next((r for r in rules if r.kind == "one_of"), None)
+    if one_of is not None:
+        by_normalized = {v.casefold(): v for v in one_of.values}
+        cleaned = output.strip("\"'`.,:;!").strip().casefold()
+        canonical = by_normalized.get(cleaned)
+        if canonical is None:
+            violations.append("reply is not one of: " + ", ".join(one_of.values))
+        else:
+            output = canonical
+    for rule in rules:
+        if rule.kind == "one_of":
+            pass
+        elif rule.kind == "matches":
+            assert rule.pattern is not None
+            if re.fullmatch(rule.pattern, output) is None:
+                violations.append(f"reply does not match the pattern: {rule.pattern}")
+        elif rule.kind == "max_chars":
+            assert rule.limit is not None
+            if len(output) > rule.limit:
+                violations.append(
+                    f"reply is {len(output)} characters; max_chars is {rule.limit}"
+                )
+        elif rule.kind == "nonempty":
+            if not output:
+                violations.append("reply is empty")
+    return output, violations
+
+
 def _run_llm_step(
     step: Step,
     context: Mapping[str, str],
@@ -211,27 +278,91 @@ def _run_llm_step(
     trace: Trace,
 ) -> str:
     prompt = _render_expression(step.prompt, context, inputs, step_outputs)
-    trace.append(
-        TraceEvent(
-            phase="step",
-            message=f"Calling LLM for step '{step.name}'",
-            data={"step": step.name, "model": step.model, "prompt": prompt},
+    if step.expect:
+        prompt = f"{prompt}\n\n{_contract_text(step.expect)}"
+
+    # A one_of contract makes this a closed-enum call; route it through the
+    # client's `route` protocol when available, so the dry-run client picks
+    # the first value deterministically — same treatment as route steps.
+    one_of = next((r for r in step.expect if r.kind == "one_of"), None)
+    route_fn = getattr(client, "route", None) if one_of is not None else None
+
+    def ask(p: str) -> str:
+        trace.append(
+            TraceEvent(
+                phase="step",
+                message=f"Calling LLM for step '{step.name}'",
+                data={"step": step.name, "model": step.model, "prompt": p},
+            )
         )
-    )
-    try:
-        response = client.complete(model=step.model, prompt=prompt)
-    except Exception as exc:
-        raise RuntimeError(
-            f"LLM call failed in step '{step.name}': {type(exc).__name__}: {exc}"
-        ) from exc
+        try:
+            if route_fn is not None:
+                assert one_of is not None
+                return route_fn(model=step.model, prompt=p, options=list(one_of.values))
+            return client.complete(model=step.model, prompt=p)
+        except Exception as exc:
+            raise RuntimeError(
+                f"LLM call failed in step '{step.name}': {type(exc).__name__}: {exc}"
+            ) from exc
+
+    response = ask(prompt)
+    if not step.expect:
+        trace.append(
+            TraceEvent(
+                phase="step",
+                message=f"Step '{step.name}' produced output",
+                data={"step": step.name, "output": response},
+            )
+        )
+        return response
+
+    output, violations = _check_expect(step.expect, response)
+    if violations:
+        trace.append(
+            TraceEvent(
+                phase="contract",
+                message=f"Step '{step.name}' output rejected",
+                data={
+                    "step": step.name,
+                    "response": response,
+                    "violations": violations,
+                    "attempt": 1,
+                },
+            )
+        )
+        retry_prompt = (
+            f"{prompt}\n\nYour previous reply violated the output contract: "
+            + "; ".join(violations)
+            + ". Reply again, satisfying every rule."
+        )
+        response = ask(retry_prompt)
+        output, violations = _check_expect(step.expect, response)
+        if violations:
+            trace.append(
+                TraceEvent(
+                    phase="contract",
+                    message=f"Step '{step.name}' output rejected",
+                    data={
+                        "step": step.name,
+                        "response": response,
+                        "violations": violations,
+                        "attempt": 2,
+                    },
+                )
+            )
+            raise RuntimeError(
+                f"step '{step.name}' violated its output contract after retry: "
+                + "; ".join(violations)
+            )
+
     trace.append(
         TraceEvent(
             phase="step",
             message=f"Step '{step.name}' produced output",
-            data={"step": step.name, "output": response},
+            data={"step": step.name, "output": output},
         )
     )
-    return response
+    return output
 
 
 def _normalize_route_output(response: str, labels: Mapping[str, str]) -> Optional[str]:

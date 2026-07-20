@@ -1,4 +1,4 @@
-(* ThreadLang grammar (v0.9 — adds route steps, then-edges, optional refs) *)
+(* ThreadLang grammar (v0.11 — adds expect output contracts on llm steps) *)
 
 program        = "thread", ws, identifier, ws, "{", ws,
                  context_block,
@@ -13,7 +13,12 @@ steps_block    = "steps", ws, "{", ws, step, { ws, step }, ws, "}" ;
 step           = "step", ws, identifier, ws, "{", ws,
                  ( llm_body | agent_body | route_body ), ws, "}" ;
 llm_body       = "llm", ws, string_literal, ws, "{", ws, expression,
-                 [ ws, then_decl ], ws, "}" ;
+                 [ ws, expect_block ], [ ws, then_decl ], ws, "}" ;
+expect_block   = "expect", ws, "{", ws, expect_rule, { ws, expect_rule }, ws, "}" ;
+expect_rule    = "one_of", ws, string_literal, { ws, ",", ws, string_literal }
+               | "matches", ws, string_literal
+               | "max_chars", ws, integer
+               | "nonempty" ;
 agent_body     = "agent", ws, string_literal, ws, "{", ws,
                  [ tools_decl, ws ], [ max_iters_decl, ws ], expression,
                  [ ws, then_decl ], ws, "}" ;
