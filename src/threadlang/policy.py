@@ -6,6 +6,7 @@ programs or put an authenticated admission layer in front of the server.
 """
 
 MAX_SOURCE_BYTES = 256 * 1024
+MAX_IR_BYTES = 1024 * 1024
 MAX_STRING_CHARS = 64 * 1024
 MAX_AGENT_ITERS = 32
 MAX_REGEX_PATTERN_CHARS = 512

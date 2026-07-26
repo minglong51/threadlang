@@ -3,6 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sqlite3
+import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -13,6 +16,9 @@ from threadlang.ir import (
     WorkflowIR,
     canonical_ir_bytes,
     compile_program,
+    load_ir_bytes,
+    program_from_ir,
+    run_ir,
     workflow_fingerprint,
 )
 from threadlang.parser import parse_program
@@ -184,6 +190,9 @@ def test_ir_public_api() -> None:
         WorkflowIR as PublicWorkflowIR,
         canonical_ir_bytes as public_canonical_ir_bytes,
         compile_program as public_compile_program,
+        load_ir_bytes as public_load_ir_bytes,
+        program_from_ir as public_program_from_ir,
+        run_ir as public_run_ir,
         workflow_fingerprint as public_workflow_fingerprint,
     )
 
@@ -191,4 +200,164 @@ def test_ir_public_api() -> None:
     assert PublicWorkflowIR is WorkflowIR
     assert public_compile_program is compile_program
     assert public_canonical_ir_bytes is canonical_ir_bytes
+    assert public_load_ir_bytes is load_ir_bytes
+    assert public_program_from_ir is program_from_ir
+    assert public_run_ir is run_ir
     assert public_workflow_fingerprint is workflow_fingerprint
+
+
+@pytest.mark.parametrize("example", sorted((REPO_ROOT / "examples").glob("*.thread")))
+def test_ir_execution_matches_ast_execution_for_examples(example: Path) -> None:
+    from threadlang.llm import DryRunClient
+    from threadlang.runtime import run_program
+
+    program = parse_program(example.read_text())
+    inputs = {
+        "name": "world",
+        "change": "safe refactor",
+        "text": "sample text",
+        "task": "2+2",
+        "stats": "all green",
+        "notes": "none",
+    }
+
+    ast_result = run_program(program, inputs, llm_client=DryRunClient())
+    ir_result = run_ir(compile_program(program), inputs, llm_client=DryRunClient())
+
+    assert ir_result == ast_result
+    assert program_from_ir(compile_program(program)) == program
+
+
+def test_load_ir_bytes_round_trips_canonical_definition() -> None:
+    workflow = compile_program(parse_program(_FULL_SOURCE))
+    loaded = load_ir_bytes(canonical_ir_bytes(workflow))
+
+    assert loaded == workflow
+    assert canonical_ir_bytes(loaded) == canonical_ir_bytes(workflow)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda obj: obj.update({"unknown": True}), "unexpected field"),
+        (lambda obj: obj.update({"ir_version": "threadlang.ir/v999"}), "unsupported IR version"),
+        (lambda obj: obj.update({"steps": "not-a-list"}), "steps must be an array"),
+        (lambda obj: obj["emit"].update({"kind": "shell"}), "unsupported emit kind"),
+    ],
+)
+def test_load_ir_bytes_rejects_invalid_or_ambiguous_payloads(mutation, message: str) -> None:
+    payload = json.loads(canonical_ir_bytes(compile_program(parse_program(_FULL_SOURCE))))
+    mutation(payload)
+
+    with pytest.raises(IRCompileError, match=message):
+        load_ir_bytes(json.dumps(payload).encode())
+
+
+def test_loaded_ir_executes_identically() -> None:
+    from threadlang.llm import DryRunClient
+
+    workflow = compile_program(parse_program(_FULL_SOURCE))
+    loaded = load_ir_bytes(canonical_ir_bytes(workflow))
+    inputs = {"request": "write a note"}
+
+    assert run_ir(loaded, inputs, llm_client=DryRunClient()) == run_ir(
+        workflow, inputs, llm_client=DryRunClient()
+    )
+
+
+def test_load_ir_rejects_semantically_invalid_graph_before_execution() -> None:
+    payload = json.loads(canonical_ir_bytes(compile_program(parse_program(_FULL_SOURCE))))
+    payload["steps"][1]["next_target"] = "classify"
+
+    with pytest.raises(IRCompileError, match="jumps backward"):
+        load_ir_bytes(json.dumps(payload).encode())
+
+
+def test_load_ir_rejects_invalid_regex_before_execution() -> None:
+    payload = json.loads(canonical_ir_bytes(compile_program(parse_program(_FULL_SOURCE))))
+    payload["steps"][2]["expect"][1]["pattern"] = "["
+
+    with pytest.raises(IRCompileError, match="pattern is invalid"):
+        load_ir_bytes(json.dumps(payload).encode())
+
+
+def test_load_ir_rejects_oversized_document() -> None:
+    from threadlang.policy import MAX_IR_BYTES
+
+    with pytest.raises(IRCompileError, match="exceeds"):
+        load_ir_bytes(b" " * (MAX_IR_BYTES + 1))
+
+
+def test_durable_run_persists_canonical_definition(tmp_path: Path) -> None:
+    from threadlang.llm import DryRunClient
+    from threadlang.store import RunStore, run_durable
+
+    program = parse_program('thread T { context {} emit text { "ok" } }')
+    store = RunStore(str(tmp_path / "runs.db"))
+    durable = run_durable(program, {}, store, llm_client=DryRunClient())
+    record = store.get_run(durable.run_id)
+
+    assert record is not None
+    assert record.ir_version == "threadlang.ir/v1"
+    assert record.definition_json is not None
+    assert record.definition_sha256 == hashlib.sha256(record.definition_json.encode()).hexdigest()
+    assert load_ir_bytes(record.definition_json.encode()) == compile_program(program)
+    store.close()
+
+
+def test_durable_replay_rejects_tampered_stored_definition(tmp_path: Path) -> None:
+    from threadlang.llm import DryRunClient
+    from threadlang.store import RunStore, run_durable
+
+    path = tmp_path / "runs.db"
+    program = parse_program('thread T { context {} emit text { "ok" } }')
+    store = RunStore(str(path))
+    durable = run_durable(program, {}, store, llm_client=DryRunClient())
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "UPDATE runs SET definition_json = ? WHERE id = ?",
+            ('{"tampered":true}', durable.run_id),
+        )
+
+    with pytest.raises(IRCompileError):
+        run_durable(program, {}, store, llm_client=DryRunClient(), run_id=durable.run_id)
+    store.close()
+
+
+def test_cli_compiles_and_runs_canonical_ir(tmp_path: Path) -> None:
+    ir_path = tmp_path / "hello.ir.json"
+    compile_result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "threadlang.cli",
+            str(REPO_ROOT / "examples" / "hello.thread"),
+            "--emit-ir",
+            str(ir_path),
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert compile_result.returncode == 0, compile_result.stderr
+    assert load_ir_bytes(ir_path.read_bytes()).name == "Hello"
+
+    run_result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "threadlang.cli",
+            str(ir_path),
+            "--from-ir",
+            "--dry-run",
+            "--input",
+            "name=system",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert run_result.returncode == 0, run_result.stderr
+    assert run_result.stdout.strip() == "Hello, system!"

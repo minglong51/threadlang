@@ -13,8 +13,10 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from threadlang.control import WorkerPool  # noqa: E402
+from threadlang.control import WorkerPool, process_one  # noqa: E402
+from threadlang.ir import canonical_ir_bytes, compile_program, load_ir_bytes  # noqa: E402
 from threadlang.llm import DryRunClient  # noqa: E402
+from threadlang.parser import parse_program  # noqa: E402
 from threadlang.policy import MAX_REQUEST_BYTES  # noqa: E402
 from threadlang.server import make_server  # noqa: E402
 from threadlang.store import RunStore  # noqa: E402
@@ -139,6 +141,51 @@ def test_post_validates_auth_inputs_and_queue_capacity(tmp_path: Path) -> None:
         assert running.request("POST", "/runs", payload=payload, authorized=True)[0] == 429
         bad = {"source": SOURCE, "inputs": {"x": 1}}
         assert running.request("POST", "/runs", payload=bad, authorized=True)[0] == 400
+    finally:
+        running.close()
+
+
+def test_post_accepts_validated_ir_and_worker_executes_it(tmp_path: Path) -> None:
+    running = _RunningServer(tmp_path)
+    workflow = compile_program(parse_program(SOURCE))
+    ir_object = json.loads(canonical_ir_bytes(workflow))
+    try:
+        status, created = running.request(
+            "POST",
+            "/runs",
+            payload={"ir": ir_object, "inputs": {}},
+            authorized=True,
+        )
+        assert status == 201 and created["status"] == "pending"
+
+        store = RunStore(running.path)
+        record = store.get_run(created["run_id"])
+        assert record is not None and record.source is None
+        assert record.definition_json is not None
+        assert load_ir_bytes(record.definition_json.encode("utf-8")) == workflow
+
+        durable = process_one(store, llm_client=DryRunClient())
+        assert durable is not None and durable.run_id == created["run_id"]
+        completed = store.get_run(created["run_id"])
+        assert completed is not None and completed.status == "completed"
+        store.close()
+    finally:
+        running.close()
+
+
+def test_post_requires_exactly_one_workflow_representation(tmp_path: Path) -> None:
+    running = _RunningServer(tmp_path)
+    ir_object = json.loads(canonical_ir_bytes(compile_program(parse_program(SOURCE))))
+    try:
+        status, _ = running.request(
+            "POST",
+            "/runs",
+            payload={"source": SOURCE, "ir": ir_object},
+            authorized=True,
+        )
+        assert status == 400
+        status, _ = running.request("POST", "/runs", payload={"inputs": {}}, authorized=True)
+        assert status == 400
     finally:
         running.close()
 

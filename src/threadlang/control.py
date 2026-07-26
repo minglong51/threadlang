@@ -25,6 +25,7 @@ import sys
 import threading
 from typing import IO, Optional
 
+from .ir import load_ir_bytes, program_from_ir
 from .llm import LLMClient
 from .parser import parse_program
 from .store import DurableRun, RunStore, run_durable
@@ -44,11 +45,17 @@ def process_one(
     claimed = store.claim_next_pending()
     if claimed is None:
         return None
-    if claimed.source is None:
-        store.mark_failed(claimed.id, "InvariantError: enqueued run has no source")
+    if claimed.source is None and claimed.definition_json is None:
+        store.mark_failed(claimed.id, "InvariantError: enqueued run has no workflow definition")
         return None
     try:
-        program = parse_program(claimed.source)
+        if claimed.definition_json is not None:
+            program = program_from_ir(load_ir_bytes(claimed.definition_json.encode("utf-8")))
+        else:
+            source = claimed.source
+            if source is None:
+                raise RuntimeError("enqueued run has no workflow definition")
+            program = parse_program(source)
         return run_durable(
             program,
             claimed.inputs,

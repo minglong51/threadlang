@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 from typing import Dict, List
 
+from .ir import canonical_ir_bytes, compile_program, load_ir_bytes, program_from_ir
 from .llm import AnthropicClient, DryRunClient, LLMClient, LLMError, OpenAICompatClient
 from .metrics import compute_metrics
 from .parser import parse_program
@@ -28,7 +29,17 @@ def _parse_inputs(input_flags: List[str]) -> Dict[str, str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run a ThreadLang source file.")
-    parser.add_argument("source", type=Path, help="Path to a .thread source file")
+    parser.add_argument("source", type=Path, help="Path to a .thread source file or IR JSON")
+    parser.add_argument(
+        "--from-ir",
+        action="store_true",
+        help="Treat SOURCE as a canonical Workflow IR JSON document instead of .thread source.",
+    )
+    parser.add_argument(
+        "--emit-ir",
+        metavar="PATH",
+        help="Compile/normalize SOURCE to canonical Workflow IR JSON and exit. Use '-' for stdout.",
+    )
     parser.add_argument(
         "--input",
         action="append",
@@ -97,6 +108,12 @@ def main() -> int:
     if args.resume and not args.store:
         print("error: --resume requires --store", file=sys.stderr)
         return 2
+    if args.emit_ir and (args.resume or args.probe is not None or args.store):
+        print(
+            "error: --emit-ir cannot be combined with --store, --resume, or --probe",
+            file=sys.stderr,
+        )
+        return 2
     if args.max_tokens < 1 or args.timeout <= 0:
         print("error: --max-tokens and --timeout must be positive", file=sys.stderr)
         return 2
@@ -122,8 +139,22 @@ def main() -> int:
 
 
 def _run(args: argparse.Namespace) -> int:
-    source_text = args.source.read_text(encoding="utf-8")
-    program = parse_program(source_text)
+    if args.from_ir:
+        workflow = load_ir_bytes(args.source.read_bytes())
+        program = program_from_ir(workflow)
+        source_text = None
+    else:
+        source_text = args.source.read_text(encoding="utf-8")
+        program = parse_program(source_text)
+        workflow = compile_program(program)
+
+    if args.emit_ir:
+        payload = canonical_ir_bytes(workflow)
+        if args.emit_ir == "-":
+            sys.stdout.buffer.write(payload + b"\n")
+        else:
+            Path(args.emit_ir).write_bytes(payload + b"\n")
+        return 0
 
     backend = "dry-run" if args.dry_run else args.backend
 

@@ -33,6 +33,13 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from .ast import AgentStep, Program
+from .ir import (
+    IR_VERSION,
+    canonical_ir_bytes,
+    compile_program,
+    load_ir_bytes,
+    workflow_fingerprint,
+)
 from .llm import LLMClient
 from .metrics import AggregateMetrics, RunMetrics, aggregate, compute_metrics, trace_span_ms
 from .policy import DEFAULT_MAX_PENDING_RUNS, DEFAULT_MAX_RETAINED_RUNS
@@ -49,6 +56,9 @@ CREATE TABLE IF NOT EXISTS runs (
     source       TEXT,                     -- program text, set when enqueued via the control plane
     program_sha256 TEXT,
     inputs_sha256  TEXT,
+    definition_json TEXT,
+    definition_sha256 TEXT,
+    ir_version TEXT,
     output       TEXT,
     error        TEXT,
     created_at   TEXT NOT NULL,
@@ -111,6 +121,9 @@ class RunRecord:
     source: Optional[str] = None
     program_sha256: Optional[str] = None
     inputs_sha256: Optional[str] = None
+    definition_json: Optional[str] = None
+    definition_sha256: Optional[str] = None
+    ir_version: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 
@@ -148,6 +161,12 @@ class RunStore:
             self._conn.execute("ALTER TABLE runs ADD COLUMN program_sha256 TEXT")
         if "inputs_sha256" not in run_cols:
             self._conn.execute("ALTER TABLE runs ADD COLUMN inputs_sha256 TEXT")
+        if "definition_json" not in run_cols:
+            self._conn.execute("ALTER TABLE runs ADD COLUMN definition_json TEXT")
+        if "definition_sha256" not in run_cols:
+            self._conn.execute("ALTER TABLE runs ADD COLUMN definition_sha256 TEXT")
+        if "ir_version" not in run_cols:
+            self._conn.execute("ALTER TABLE runs ADD COLUMN ir_version TEXT")
         self._conn.executescript(
             "CREATE INDEX IF NOT EXISTS idx_runs_status_created "
             "ON runs(status, created_at, id);"
@@ -171,6 +190,9 @@ class RunStore:
             source=row["source"],
             program_sha256=row["program_sha256"],
             inputs_sha256=row["inputs_sha256"],
+            definition_json=row["definition_json"],
+            definition_sha256=row["definition_sha256"],
+            ir_version=row["ir_version"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
@@ -184,19 +206,25 @@ class RunStore:
         *,
         program_sha256: Optional[str] = None,
         inputs_sha256: Optional[str] = None,
+        definition_json: Optional[str] = None,
+        definition_sha256: Optional[str] = None,
+        ir_version: Optional[str] = None,
     ) -> str:
         run_id = uuid.uuid4().hex
         now = _now()
         self._conn.execute(
             "INSERT INTO runs (id, program_name, status, inputs_json, program_sha256, "
-            "inputs_sha256, created_at, updated_at) "
-            "VALUES (?, ?, 'created', ?, ?, ?, ?, ?)",
+            "inputs_sha256, definition_json, definition_sha256, ir_version, created_at, updated_at) "
+            "VALUES (?, ?, 'created', ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 run_id,
                 program_name,
                 json.dumps(dict(inputs)),
                 program_sha256,
                 inputs_sha256 or _inputs_fingerprint(inputs),
+                definition_json,
+                definition_sha256,
+                ir_version,
                 now,
                 now,
             ),
@@ -225,12 +253,61 @@ class RunStore:
         source: str,
         inputs: Dict[str, str],
         *,
+        definition_json: Optional[str] = None,
+        definition_sha256: Optional[str] = None,
+        ir_version: Optional[str] = None,
         max_pending: int = DEFAULT_MAX_PENDING_RUNS,
         max_retained: int = DEFAULT_MAX_RETAINED_RUNS,
     ) -> str:
-        """Create a run in `pending` state without executing it. A worker
-        claims and runs it later. The program `source` is stored so any worker
-        can reconstruct the program."""
+        """Enqueue source text for a worker to parse and execute."""
+        return self._enqueue_definition(
+            program_name,
+            inputs,
+            source=source,
+            program_sha256=hashlib.sha256(source.encode("utf-8")).hexdigest(),
+            definition_json=definition_json,
+            definition_sha256=definition_sha256,
+            ir_version=ir_version,
+            max_pending=max_pending,
+            max_retained=max_retained,
+        )
+
+    def enqueue_ir(
+        self,
+        program_name: str,
+        definition_json: str,
+        definition_sha256: str,
+        ir_version: str,
+        inputs: Dict[str, str],
+        *,
+        max_pending: int = DEFAULT_MAX_PENDING_RUNS,
+        max_retained: int = DEFAULT_MAX_RETAINED_RUNS,
+    ) -> str:
+        """Enqueue a validated canonical IR definition without source text."""
+        return self._enqueue_definition(
+            program_name,
+            inputs,
+            definition_json=definition_json,
+            definition_sha256=definition_sha256,
+            ir_version=ir_version,
+            program_sha256=definition_sha256,
+            max_pending=max_pending,
+            max_retained=max_retained,
+        )
+
+    def _enqueue_definition(
+        self,
+        program_name: str,
+        inputs: Dict[str, str],
+        *,
+        program_sha256: str,
+        source: Optional[str] = None,
+        definition_json: Optional[str] = None,
+        definition_sha256: Optional[str] = None,
+        ir_version: Optional[str] = None,
+        max_pending: int,
+        max_retained: int,
+    ) -> str:
         run_id = uuid.uuid4().hex
         now = _now()
         self._conn.execute("BEGIN IMMEDIATE")
@@ -243,15 +320,19 @@ class RunStore:
             self._prune_terminal_locked(max_retained)
             self._conn.execute(
                 "INSERT INTO runs (id, program_name, status, inputs_json, source, "
-                "program_sha256, inputs_sha256, created_at, updated_at) "
-                "VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?)",
+                "program_sha256, inputs_sha256, definition_json, definition_sha256, "
+                "ir_version, created_at, updated_at) "
+                "VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     run_id,
                     program_name,
                     json.dumps(dict(inputs)),
                     source,
-                    hashlib.sha256(source.encode("utf-8")).hexdigest(),
+                    program_sha256,
                     _inputs_fingerprint(inputs),
+                    definition_json,
+                    definition_sha256,
+                    ir_version,
                     now,
                     now,
                 ),
@@ -285,11 +366,30 @@ class RunStore:
         ).fetchall()
         return {row["status"]: row["count"] for row in rows}
 
-    def bind_run_identity(self, run_id: str, program_sha256: str, inputs_sha256: str) -> None:
+    def bind_run_identity(
+        self,
+        run_id: str,
+        program_sha256: str,
+        inputs_sha256: str,
+        *,
+        definition_json: Optional[str] = None,
+        definition_sha256: Optional[str] = None,
+        ir_version: Optional[str] = None,
+    ) -> None:
         self._conn.execute(
             "UPDATE runs SET program_sha256 = COALESCE(program_sha256, ?), "
-            "inputs_sha256 = COALESCE(inputs_sha256, ?) WHERE id = ?",
-            (program_sha256, inputs_sha256, run_id),
+            "inputs_sha256 = COALESCE(inputs_sha256, ?), "
+            "definition_json = COALESCE(definition_json, ?), "
+            "definition_sha256 = COALESCE(definition_sha256, ?), "
+            "ir_version = COALESCE(ir_version, ?) WHERE id = ?",
+            (
+                program_sha256,
+                inputs_sha256,
+                definition_json,
+                definition_sha256,
+                ir_version,
+                run_id,
+            ),
         )
 
     def claim_next_pending(self) -> Optional[RunRecord]:
@@ -325,6 +425,9 @@ class RunStore:
             source=record.source,
             program_sha256=record.program_sha256,
             inputs_sha256=record.inputs_sha256,
+            definition_json=record.definition_json,
+            definition_sha256=record.definition_sha256,
+            ir_version=record.ir_version,
             created_at=record.created_at,
             updated_at=record.updated_at,
         )
@@ -332,12 +435,14 @@ class RunStore:
     def requeue_orphans(self) -> int:
         """Reset runs stranded in `running` (e.g. by a process crash or
         restart) back to `pending` so a worker can re-claim them. Only runs
-        with a persisted `source` are requeued — re-dispatch needs the program
-        text. Safe because resume via `run_durable` is idempotent. Returns the
-        number of runs requeued."""
+        with a persisted source or canonical IR definition are requeued —
+        re-dispatch needs one complete workflow representation. Safe because
+        resume via `run_durable` is idempotent. Returns the number of runs
+        requeued."""
         cursor = self._conn.execute(
             "UPDATE runs SET status = 'pending', updated_at = ? "
-            "WHERE status = 'running' AND source IS NOT NULL",
+            "WHERE status = 'running' "
+            "AND (source IS NOT NULL OR definition_json IS NOT NULL)",
             (_now(),),
         )
         return cursor.rowcount
@@ -492,15 +597,40 @@ def run_durable(
     resume_outputs: Optional[Dict[str, str]] = None
     program_sha256 = _program_fingerprint(program, source)
     inputs_sha256 = _inputs_fingerprint(inputs)
+    workflow = compile_program(program)
+    definition_bytes = canonical_ir_bytes(workflow)
+    definition_json = definition_bytes.decode("utf-8")
+    definition_sha256 = workflow_fingerprint(workflow)
 
     if run_id is not None:
         record = store.get_run(run_id)
         if record is None:
             raise ValueError(f"unknown run_id: {run_id}")
-        if record.program_sha256 is not None and record.program_sha256 != program_sha256:
+        if (
+            record.definition_sha256 is None
+            and record.program_sha256 is not None
+            and record.program_sha256 != program_sha256
+        ):
             raise ValueError("resume refused: program source does not match the original run")
         if record.inputs_sha256 is not None and record.inputs_sha256 != inputs_sha256:
             raise ValueError("resume refused: inputs do not match the original run")
+        if record.ir_version is not None and record.ir_version != IR_VERSION:
+            raise ValueError(f"resume refused: unsupported stored IR version {record.ir_version!r}")
+        if record.definition_json is not None:
+            stored_bytes = record.definition_json.encode("utf-8")
+            stored_workflow = load_ir_bytes(stored_bytes)
+            stored_digest = workflow_fingerprint(stored_workflow)
+            if record.definition_sha256 is None or stored_digest != record.definition_sha256:
+                raise ValueError(
+                    "resume refused: stored workflow definition failed integrity check"
+                )
+        if record.definition_sha256 is not None and record.definition_sha256 != definition_sha256:
+            # Preserve the v0.12 diagnostic substring for callers/tests while
+            # making clear that canonical IR identity is now authoritative.
+            raise ValueError(
+                "resume refused: program source does not match the original run "
+                "(workflow definition mismatch)"
+            )
         if record.status == "completed" and record.output is not None:
             # Already done — replay the stored result rather than re-running.
             return DurableRun(
@@ -516,7 +646,13 @@ def run_durable(
                 raise ValueError("claimed run is no longer running")
         elif record.status not in ("created", "failed"):
             raise ValueError("run is already active or is not resumable")
-        if record.program_sha256 is None or record.inputs_sha256 is None:
+        identity_missing = record.program_sha256 is None or record.inputs_sha256 is None
+        definition_missing = (
+            record.definition_json is None
+            or record.definition_sha256 is None
+            or record.ir_version is None
+        )
+        if identity_missing:
             # A fresh v0.12 CLI run is still `created`; a claimed queue run is
             # executing source read from this record. A migrated failed CLI run
             # with no persisted source cannot prove which program produced its
@@ -528,7 +664,15 @@ def run_durable(
             )
             if not identity_is_provable:
                 raise ValueError("resume refused: legacy run has no verifiable program identity")
-            store.bind_run_identity(run_id, program_sha256, inputs_sha256)
+        if identity_missing or definition_missing:
+            store.bind_run_identity(
+                run_id,
+                program_sha256,
+                inputs_sha256,
+                definition_json=definition_json,
+                definition_sha256=definition_sha256,
+                ir_version=IR_VERSION,
+            )
         resume_outputs = store.load_step_outputs(run_id)
         if not claimed:
             store.mark_running(run_id, expected=record.status)
@@ -538,6 +682,9 @@ def run_durable(
             inputs,
             program_sha256=program_sha256,
             inputs_sha256=inputs_sha256,
+            definition_json=definition_json,
+            definition_sha256=definition_sha256,
+            ir_version=IR_VERSION,
         )
         store.mark_running(run_id, expected="created")
 

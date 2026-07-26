@@ -26,7 +26,9 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 import pytest  # type: ignore  # noqa: E402
 
 from threadlang.control import WorkerPool, process_one  # noqa: E402
+from threadlang.ir import canonical_ir_bytes, compile_program, workflow_fingerprint  # noqa: E402
 from threadlang.llm import DryRunClient  # noqa: E402
+from threadlang.parser import parse_program  # noqa: E402
 from threadlang.store import RunStore, RunStoreCapacityError  # noqa: E402
 
 
@@ -163,6 +165,31 @@ def test_malformed_persisted_source_fails_run_without_raising(tmp_path: Path) ->
     record = store.get_run(run_id)
     assert record is not None and record.status == "failed"
     assert "ParseError" in (record.error or "")
+    store.close()
+
+
+def test_ir_only_orphan_is_requeued_and_completed(tmp_path: Path) -> None:
+    store = RunStore(str(tmp_path / "ir-orphan.db"))
+    workflow = compile_program(parse_program(_ONE_STEP))
+    definition_json = canonical_ir_bytes(workflow).decode("utf-8")
+    run_id = store.enqueue_ir(
+        workflow.name,
+        definition_json,
+        workflow_fingerprint(workflow),
+        workflow.ir_version,
+        {"x": "1"},
+    )
+
+    claimed = store.claim_next_pending()
+    assert claimed is not None and claimed.source is None
+    assert claimed.definition_json == definition_json
+    assert store.requeue_orphans() == 1
+
+    durable = process_one(store, llm_client=DryRunClient())
+    assert durable is not None and durable.run_id == run_id
+    record = store.get_run(run_id)
+    assert record is not None and record.status == "completed"
+    assert "run:1" in (record.output or "")
     store.close()
 
 

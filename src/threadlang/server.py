@@ -18,6 +18,14 @@ from urllib.parse import parse_qs, urlsplit
 
 from .control import WorkerPool
 from .dashboard import render_run_detail, render_run_list
+from .ir import (
+    IRCompileError,
+    canonical_ir_bytes,
+    compile_program,
+    load_ir_bytes,
+    program_from_ir,
+    workflow_fingerprint,
+)
 from .llm import LLMClient
 from .parser import ParseError, parse_program
 from .policy import (
@@ -45,7 +53,7 @@ def _is_loopback_host(host: str) -> bool:
 
 
 class _Handler(BaseHTTPRequestHandler):
-    server_version = "threadlang/0.12"
+    server_version = "threadlang/0.13"
 
     def _store(self) -> RunStore:
         return RunStore(self.server.store_path)  # type: ignore[attr-defined]
@@ -283,32 +291,65 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(400, {"error": "body must be a JSON object"})
             return
         source = body.get("source")
-        if not isinstance(source, str) or not source.strip():
-            self._send(400, {"error": "missing 'source' (program text)"})
-            return
-        if len(source.encode("utf-8")) > MAX_SOURCE_BYTES:
-            self._send(413, {"error": f"source exceeds {MAX_SOURCE_BYTES} bytes"})
+        ir_object = body.get("ir")
+        if (source is None) == (ir_object is None):
+            self._send(400, {"error": "provide exactly one of 'source' or 'ir'"})
             return
         inputs = body.get("inputs", {})
         error = _validate_inputs(inputs)
         if error is not None:
             self._send(400, {"error": error})
             return
+
         try:
-            program = parse_program(source)
-        except ParseError as exc:
-            self._send(400, {"error": f"parse error: {exc}"})
+            if source is not None:
+                if not isinstance(source, str) or not source.strip():
+                    self._send(400, {"error": "'source' must be non-empty program text"})
+                    return
+                if len(source.encode("utf-8")) > MAX_SOURCE_BYTES:
+                    self._send(413, {"error": f"source exceeds {MAX_SOURCE_BYTES} bytes"})
+                    return
+                program = parse_program(source)
+                workflow = compile_program(program)
+            else:
+                ir_bytes = json.dumps(
+                    ir_object, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+                ).encode("utf-8")
+                workflow = load_ir_bytes(ir_bytes)
+                program = program_from_ir(workflow)
+        except (ParseError, IRCompileError) as exc:
+            self._send(400, {"error": f"invalid workflow: {exc}"})
             return
+
+        definition_bytes = canonical_ir_bytes(workflow)
+        definition_json = definition_bytes.decode("utf-8")
+        definition_sha256 = workflow_fingerprint(workflow)
         store = self._store()
         try:
             try:
-                run_id = store.enqueue_run(
-                    program.thread_name,
-                    source,
-                    dict(inputs),
-                    max_pending=self.server.max_pending,  # type: ignore[attr-defined]
-                    max_retained=self.server.max_retained,  # type: ignore[attr-defined]
-                )
+                enqueue_kwargs = {
+                    "max_pending": self.server.max_pending,  # type: ignore[attr-defined]
+                    "max_retained": self.server.max_retained,  # type: ignore[attr-defined]
+                }
+                if source is not None:
+                    run_id = store.enqueue_run(
+                        program.thread_name,
+                        source,
+                        dict(inputs),
+                        definition_json=definition_json,
+                        definition_sha256=definition_sha256,
+                        ir_version=workflow.ir_version,
+                        **enqueue_kwargs,
+                    )
+                else:
+                    run_id = store.enqueue_ir(
+                        program.thread_name,
+                        definition_json,
+                        definition_sha256,
+                        workflow.ir_version,
+                        dict(inputs),
+                        **enqueue_kwargs,
+                    )
             except RunStoreCapacityError as exc:
                 self._send(429, {"error": str(exc)})
                 return
@@ -344,6 +385,8 @@ def _run_summary(record) -> dict:
         "updated_at": record.updated_at,
         "program_sha256": record.program_sha256,
         "inputs_sha256": record.inputs_sha256,
+        "definition_sha256": record.definition_sha256,
+        "ir_version": record.ir_version,
     }
 
 

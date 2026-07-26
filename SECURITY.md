@@ -2,7 +2,7 @@
 
 ## Supported version
 
-Security fixes are applied to the latest release line. The v0.12 production profile is limited to one POSIX host, one process per local SQLite store, and the constraints in [`docs/production.md`](docs/production.md).
+Security fixes are applied to the latest release line. The v0.13 production profile is limited to one POSIX host, one process per local SQLite store, and the constraints in [`docs/production.md`](docs/production.md) and [`docs/ir-production.md`](docs/ir-production.md).
 
 ## Reporting
 

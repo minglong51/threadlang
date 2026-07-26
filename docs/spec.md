@@ -1,4 +1,4 @@
-# ThreadLang Specification (language v1, runtime v0.12)
+# ThreadLang Specification (language v1, runtime v0.13)
 
 ## Overview
 
@@ -68,7 +68,7 @@ term        = string | "context." name | "inputs." name
 - Comments and delimiters inside quoted strings are lexical content, not
   structure. The parser consumes all input and reports line/column errors.
 
-### Durability and deployment (v0.12)
+### Durability and deployment (v0.13)
 
 The language semantics are independent of storage. The bundled durable runtime
 provides step-boundary checkpoints on one POSIX process and one local SQLite

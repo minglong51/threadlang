@@ -1,6 +1,6 @@
 # ThreadLang v0.13 architecture proposal
 
-**Status:** pressure-tested draft; first compatibility slice approved for implementation
+**Status:** compatibility execution and durable definition binding implemented and validated for the documented single-node production profile
 
 ## Problem
 
@@ -17,7 +17,7 @@ Introduce a **versioned, canonical workflow IR** between the source AST and exec
                                                    `-> future IR interpreter
 ```
 
-The first slice is intentionally non-executing: it compiles every existing v0.12 construct into lossless canonical IR and exposes stable serialization/fingerprinting. `run_program` and durable execution remain unchanged until differential tests prove an IR interpreter is equivalent.
+The compatibility path now compiles every existing v0.12 construct into lossless canonical IR, strictly reloads untrusted IR JSON, and executes it through an explicit IR→AST bridge. New durable runs persist the canonical definition, IR version, and definition digest. The underlying `run_program` interpreter remains authoritative until a native IR interpreter has independent differential evidence.
 
 ## Why this boundary
 
@@ -94,9 +94,9 @@ Rejected because syntax is the easy part; cancellation, redelivery, migration, a
 - Test term, contract, route, agent, and emit preservation.
 - Do not change runtime behavior.
 
-### Slice B — differential interpreter
+### Slice B — differential compatibility bridge
 
-- Implement an IR interpreter behind an opt-in library entrypoint.
+- Implement an IR→AST compatibility execution entrypoint.
 - Run AST and IR interpreters against identical scripted clients.
 - Compare outputs, step outputs, call order, prompts, and trace semantics.
 - Keep durable production execution on the old interpreter until equivalence is demonstrated.
@@ -114,6 +114,6 @@ Rejected because syntax is the easy part; cancellation, redelivery, migration, a
 
 ## Approval boundary
 
-Approved now: Slice A, because it is additive and cannot alter execution.
+Approved and implemented for v0.13: Slices A–C on the documented single-node profile. The authoritative interpreter remains `run_program`; the IR execution entrypoint strictly validates canonical IR and then uses the compatibility bridge. Durable identity changes are additive and retain migration coverage for v0.12 stores.
 
-Blocked pending separate design reviews: changing `run_program`, changing durable database identity, arbitrary cycles, parallel scheduling, external events, or distributed execution.
+Blocked pending separate design reviews: a native IR interpreter, arbitrary cycles, parallel scheduling, external events, in-flight definition migration, or distributed execution.

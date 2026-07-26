@@ -7,6 +7,9 @@ from .ir import (
     WorkflowIR,
     canonical_ir_bytes,
     compile_program,
+    load_ir_bytes,
+    program_from_ir,
+    run_ir,
     workflow_fingerprint,
 )
 from .llm import (
@@ -34,12 +37,15 @@ from .server import make_server, serve
 from .store import DurableRun, RunRecord, RunStore, RunStoreCapacityError, run_durable
 from .tools import FunctionTool, Tool, ToolRegistry, ToolSpec, default_registry
 
-__version__ = "0.12.0"
+__version__ = "0.13.0"
 
 __all__ = [
     "parse_program",
     "ParseError",
     "compile_program",
+    "load_ir_bytes",
+    "program_from_ir",
+    "run_ir",
     "canonical_ir_bytes",
     "workflow_fingerprint",
     "WorkflowIR",
