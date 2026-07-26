@@ -26,13 +26,38 @@ from .kb import ARTICLES, Article
 # (functional problem) — rule-based on purpose: deterministic and inspectable,
 # no model call needed to classify. Everything else is sev-2.
 _P0_SIGNALS = {
-    "outage", "down", "offline", "unreachable", "500", "503", "critical",
-    "urgent", "asap", "emergency", "data loss", "cannot access", "can't access",
-    "locked out", "breach", "security",
+    "outage",
+    "down",
+    "offline",
+    "unreachable",
+    "500",
+    "503",
+    "critical",
+    "urgent",
+    "asap",
+    "emergency",
+    "data loss",
+    "cannot access",
+    "can't access",
+    "locked out",
+    "breach",
+    "security",
 }
 _P1_SIGNALS = {
-    "error", "failed", "failing", "broken", "bug", "billing", "refund", "charge",
-    "overcharged", "429", "rate limit", "cannot log in", "can't log in", "reset",
+    "error",
+    "failed",
+    "failing",
+    "broken",
+    "bug",
+    "billing",
+    "refund",
+    "charge",
+    "overcharged",
+    "429",
+    "rate limit",
+    "cannot log in",
+    "can't log in",
+    "reset",
 }
 
 _PRIORITY_LABELS = {
@@ -94,9 +119,7 @@ _CLASSIFY_PRIORITY = FunctionTool(
         ),
         parameters={
             "type": "object",
-            "properties": {
-                "text": {"type": "string", "description": "The ticket's full text."}
-            },
+            "properties": {"text": {"type": "string", "description": "The ticket's full text."}},
             "required": ["text"],
         },
     ),

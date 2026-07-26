@@ -11,21 +11,21 @@ exercises real tool feedback without an API key.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 import sys
-from typing import List, Sequence
+from typing import Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 import pytest  # type: ignore  # noqa: E402
 
-from threadlang.ast import AgentStep, Step  # noqa: E402
+from threadlang.ast import AgentStep  # noqa: E402
 from threadlang.llm import AgentTurn, DryRunClient, ToolCall  # noqa: E402
-from threadlang.parser import ParseError, parse_program  # noqa: E402
+from threadlang.parser import parse_program  # noqa: E402
 from threadlang.runtime import RuntimeError as TLRuntimeError, run_program  # noqa: E402
-from threadlang.tools import ToolRegistry, default_registry  # noqa: E402
+from threadlang.tools import default_registry  # noqa: E402
 from threadlang.trace import DenialCode  # noqa: E402
 
 
@@ -89,7 +89,9 @@ class ScriptedAgent:
         if self.turns == 1:
             return AgentTurn(
                 text="",
-                tool_calls=(ToolCall(id="c1", name="calculator", arguments={"expression": "21*2"}),),
+                tool_calls=(
+                    ToolCall(id="c1", name="calculator", arguments={"expression": "21*2"}),
+                ),
             )
         observation = [m for m in messages if m.get("role") == "tool"][-1]["content"]
         return AgentTurn(text=f"the answer is {observation}", tool_calls=())
@@ -106,8 +108,7 @@ def test_tool_result_feeds_back_into_next_turn() -> None:
     result = run_program(parse_program(source), inputs={}, llm_client=ScriptedAgent())
     assert result.output == "the answer is 42"
     assert any(
-        e.message.startswith("Tool 'calculator'") and e.data["result"] == "42"
-        for e in result.trace
+        e.message.startswith("Tool 'calculator'") and e.data["result"] == "42" for e in result.trace
     )
 
 
@@ -147,7 +148,9 @@ def test_agent_cannot_call_a_tool_it_was_not_given() -> None:
             if not any(m.get("role") == "tool" for m in messages):
                 return AgentTurn(
                     text="",
-                    tool_calls=(ToolCall(id="c1", name="calculator", arguments={"expression": "2+2"}),),
+                    tool_calls=(
+                        ToolCall(id="c1", name="calculator", arguments={"expression": "2+2"}),
+                    ),
                 )
             return AgentTurn(text="done", tool_calls=())
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Dict, List, Mapping, Protocol, Sequence
@@ -147,6 +148,7 @@ class AnthropicClient:
         self,
         api_key: str | None = None,
         max_tokens: int = 1024,
+        timeout: float = 120.0,
     ) -> None:
         try:
             from anthropic import Anthropic  # type: ignore
@@ -157,10 +159,8 @@ class AnthropicClient:
 
         key = api_key or os.environ.get("ANTHROPIC_API_KEY")
         if not key:
-            raise LLMError(
-                "ANTHROPIC_API_KEY not set in environment and no api_key passed."
-            )
-        self._client = Anthropic(api_key=key)
+            raise LLMError("ANTHROPIC_API_KEY not set in environment and no api_key passed.")
+        self._client = Anthropic(api_key=key, timeout=timeout)
         self._max_tokens = max_tokens
 
     def complete(self, model: str, prompt: str) -> str:
@@ -169,11 +169,15 @@ class AnthropicClient:
             max_tokens=self._max_tokens,
             messages=[{"role": "user", "content": prompt}],
         )
+        if getattr(resp, "stop_reason", None) == "max_tokens":
+            raise LLMError("provider response was truncated at max_tokens")
         # Take the first text block; ignore tool-use / other types for v1.
         for block in resp.content:
             if getattr(block, "type", None) == "text":
-                return block.text  # type: ignore[attr-defined]
-        return ""
+                text = block.text  # type: ignore[attr-defined]
+                if text:
+                    return text
+        raise LLMError("provider returned no text content")
 
     def agent_step(
         self, model: str, messages: Sequence[Message], tools: Sequence[ToolSpec]
@@ -189,6 +193,8 @@ class AnthropicClient:
                 for t in tools
             ]
         resp = self._client.messages.create(**kwargs)  # type: ignore[arg-type]
+        if getattr(resp, "stop_reason", None) == "max_tokens":
+            raise LLMError("provider response was truncated at max_tokens")
         text_parts: List[str] = []
         calls: List[ToolCall] = []
         for block in resp.content:
@@ -203,7 +209,10 @@ class AnthropicClient:
                         arguments=dict(block.input),  # type: ignore[attr-defined]
                     )
                 )
-        return AgentTurn(text="".join(text_parts), tool_calls=tuple(calls))
+        turn = AgentTurn(text="".join(text_parts), tool_calls=tuple(calls))
+        if not turn.text and not turn.tool_calls:
+            raise LLMError("provider returned neither text nor tool calls")
+        return turn
 
 
 def _to_anthropic_messages(messages: Sequence[Message]) -> List[Dict[str, object]]:
@@ -271,12 +280,13 @@ class OpenAICompatClient:
         self._base_url = (
             base_url or os.environ.get("THREADLANG_BASE_URL") or DEEPSEEK_BASE_URL
         ).rstrip("/")
+        parsed_base = urllib.parse.urlsplit(self._base_url)
+        if parsed_base.scheme not in ("http", "https") or not parsed_base.hostname:
+            raise LLMError("OpenAI-compatible base URL must use http or https and include a host")
         # A key is optional: local servers (Ollama) ignore it. Hosted providers
         # 401 without one, which surfaces as a clear LLMError at call time.
         self._api_key = (
-            api_key
-            or os.environ.get("THREADLANG_API_KEY")
-            or os.environ.get("OPENAI_API_KEY")
+            api_key or os.environ.get("THREADLANG_API_KEY") or os.environ.get("OPENAI_API_KEY")
         )
         self._max_tokens = max_tokens
         self._timeout = timeout
@@ -290,17 +300,24 @@ class OpenAICompatClient:
             f"{self._base_url}/chat/completions", data=data, headers=headers, method="POST"
         )
         try:
-            with urllib.request.urlopen(request, timeout=self._timeout) as resp:
+            # URL scheme and host are validated in __init__; urllib is used to
+            # keep the OpenAI-compatible adapter dependency-free.
+            with urllib.request.urlopen(  # nosec B310
+                request, timeout=self._timeout
+            ) as resp:
                 body = resp.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", "replace")[:500]
-            raise LLMError(f"HTTP {exc.code} from {self._base_url}: {detail}") from exc
+            # Provider bodies may contain request fragments, account metadata,
+            # or echoed secrets. Persist only the status and endpoint; operators
+            # can correlate provider-side logs without leaking the body into the
+            # durable run record or dashboard.
+            raise LLMError(f"HTTP {exc.code} from {self._base_url}") from exc
         except urllib.error.URLError as exc:
             raise LLMError(f"could not reach {self._base_url}: {exc.reason}") from exc
         try:
             return json.loads(body)
         except json.JSONDecodeError as exc:
-            raise LLMError(f"non-JSON response from {self._base_url}: {body[:300]}") from exc
+            raise LLMError(f"non-JSON response from {self._base_url}") from exc
 
     def complete(self, model: str, prompt: str) -> str:
         resp = self._post(
@@ -310,7 +327,13 @@ class OpenAICompatClient:
                 "messages": [{"role": "user", "content": prompt}],
             }
         )
-        return _openai_message(resp).get("content") or ""
+        choice = _openai_choice(resp)
+        if choice.get("finish_reason") == "length":
+            raise LLMError("provider response was truncated at max_tokens")
+        content = _openai_message(resp).get("content")
+        if not isinstance(content, str) or not content:
+            raise LLMError("provider returned no text content")
+        return content
 
     def agent_step(
         self, model: str, messages: Sequence[Message], tools: Sequence[ToolSpec]
@@ -332,7 +355,11 @@ class OpenAICompatClient:
                 }
                 for t in tools
             ]
-        message = _openai_message(self._post(payload))
+        response = self._post(payload)
+        choice = _openai_choice(response)
+        if choice.get("finish_reason") == "length":
+            raise LLMError("provider response was truncated at max_tokens")
+        message = _openai_message(response)
         text = message.get("content") or ""
         calls: List[ToolCall] = []
         for raw in message.get("tool_calls") or ():
@@ -349,15 +376,22 @@ class OpenAICompatClient:
                     arguments=arguments if isinstance(arguments, dict) else {},
                 )
             )
-        return AgentTurn(text=str(text), tool_calls=tuple(calls))
+        turn = AgentTurn(text=str(text), tool_calls=tuple(calls))
+        if not turn.text and not turn.tool_calls:
+            raise LLMError("provider returned neither text nor tool calls")
+        return turn
+
+
+def _openai_choice(resp: Mapping[str, object]) -> Mapping[str, object]:
+    choices = resp.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], Mapping):
+        raise LLMError("provider response contains no valid choices")
+    return choices[0]
 
 
 def _openai_message(resp: Mapping[str, object]) -> Dict[str, object]:
     """Pull `choices[0].message` from a chat-completions response, defensively."""
-    choices = resp.get("choices")
-    if not isinstance(choices, list) or not choices:
-        raise LLMError(f"no choices in response: {json.dumps(resp)[:300]}")
-    message = choices[0].get("message") if isinstance(choices[0], Mapping) else None
+    message = _openai_choice(resp).get("message")
     if not isinstance(message, Mapping):
         raise LLMError("malformed choice: no message object")
     return dict(message)

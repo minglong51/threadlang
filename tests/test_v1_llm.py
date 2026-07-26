@@ -32,7 +32,9 @@ class MockClient:
     def complete(self, model: str, prompt: str) -> str:
         self.calls.append((model, prompt))
         if not self.responses:
-            raise AssertionError(f"MockClient ran out of responses on call: ({model!r}, {prompt!r})")
+            raise AssertionError(
+                f"MockClient ran out of responses on call: ({model!r}, {prompt!r})"
+            )
         return self.responses.pop(0)
 
 
@@ -158,8 +160,8 @@ def test_forward_reference_to_step_raises() -> None:
       emit text { steps.later.output }
     }
     """
-    with pytest.raises(TLRuntimeError, match="step 'never_defined' before it ran"):
-        run_program(parse_program(source), inputs={}, llm_client=MockClient(responses=["x"]))
+    with pytest.raises(ParseError, match="references step 'never_defined' before it is available"):
+        parse_program(source)
 
 
 def test_duplicate_step_names_rejected_at_parse_time() -> None:

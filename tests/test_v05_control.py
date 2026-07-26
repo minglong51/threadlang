@@ -27,7 +27,7 @@ import pytest  # type: ignore  # noqa: E402
 
 from threadlang.control import WorkerPool, process_one  # noqa: E402
 from threadlang.llm import DryRunClient  # noqa: E402
-from threadlang.store import RunStore  # noqa: E402
+from threadlang.store import RunStore, RunStoreCapacityError  # noqa: E402
 
 
 _ONE_STEP = """
@@ -117,6 +117,29 @@ class _AlwaysFails:
         raise RuntimeError("boom")
 
 
+class _FailsOnce:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def complete(self, model: str, prompt: str) -> str:
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("first fails")
+        return "ok"
+
+
+def test_drain_continues_after_failed_run(tmp_path: Path) -> None:
+    store = RunStore(str(tmp_path / "drain.db"))
+    first = store.enqueue_run("Q", _ONE_STEP, {"x": "1"})
+    second = store.enqueue_run("Q", _ONE_STEP, {"x": "2"})
+    pool = WorkerPool(str(tmp_path / "drain.db"), n_workers=1, llm_client=_FailsOnce())
+
+    assert pool.drain(store) == 2
+    assert store.get_run(first).status == "failed"  # type: ignore[union-attr]
+    assert store.get_run(second).status == "completed"  # type: ignore[union-attr]
+    store.close()
+
+
 def test_failed_run_is_recorded_and_worker_survives(tmp_path: Path) -> None:
     store = RunStore(str(tmp_path / "q.db"))
     bad = store.enqueue_run("Q", _ONE_STEP, {"x": "1"})
@@ -131,3 +154,49 @@ def test_failed_run_is_recorded_and_worker_survives(tmp_path: Path) -> None:
     # would simply move on.
     assert process_one(store, llm_client=DryRunClient()) is None
     store.close()
+
+
+def test_malformed_persisted_source_fails_run_without_raising(tmp_path: Path) -> None:
+    store = RunStore(str(tmp_path / "malformed.db"))
+    run_id = store.enqueue_run("Broken", "not threadlang", {})
+    assert process_one(store, llm_client=DryRunClient()) is None
+    record = store.get_run(run_id)
+    assert record is not None and record.status == "failed"
+    assert "ParseError" in (record.error or "")
+    store.close()
+
+
+def test_pending_queue_limit_and_terminal_retention(tmp_path: Path) -> None:
+    store = RunStore(str(tmp_path / "bounded.db"))
+    first = store.enqueue_run("Q", _ONE_STEP, {"x": "1"}, max_pending=1)
+    with pytest.raises(RunStoreCapacityError, match="pending run limit"):
+        store.enqueue_run("Q", _ONE_STEP, {"x": "2"}, max_pending=1)
+    assert process_one(store, llm_client=DryRunClient()) is not None
+    assert store.get_run(first).status == "completed"  # type: ignore[union-attr]
+
+    second = store.enqueue_run("Q", _ONE_STEP, {"x": "2"}, max_pending=1, max_retained=0)
+    assert store.get_run(first) is None
+    assert store.get_run(second).status == "pending"  # type: ignore[union-attr]
+    store.close()
+
+
+def test_worker_pool_health_tracks_lifecycle(tmp_path: Path) -> None:
+    pool = WorkerPool(str(tmp_path / "health.db"), n_workers=1, poll_interval=0.01)
+    assert not pool.is_healthy()
+    pool.start()
+    assert pool.is_healthy()
+    assert pool.status() == {"configured": 1, "alive": 1, "healthy": True}
+    pool.stop()
+    assert not pool.is_healthy()
+
+
+def test_second_worker_pool_cannot_requeue_active_store(tmp_path: Path) -> None:
+    path = str(tmp_path / "runs.db")
+    first = WorkerPool(path, n_workers=1, poll_interval=0.01)
+    second = WorkerPool(path, n_workers=1, poll_interval=0.01)
+    first.start()
+    try:
+        with pytest.raises(RuntimeError, match="another ThreadLang worker pool"):
+            second.start()
+    finally:
+        first.stop()

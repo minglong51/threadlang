@@ -1,0 +1,13 @@
+.git
+.github
+.hermes
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.venv
+__pycache__
+*.py[cod]
+*.db
+*.sqlite*
+build
+dist

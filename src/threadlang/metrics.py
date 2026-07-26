@@ -36,9 +36,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple, TypedDict
 
 from .trace import TraceEvent
+
+
+class _ProgramAccumulator(TypedDict):
+    runs: int
+    completed: int
+    failed: int
+    durations: List[float]
+
 
 _ACTIVE = ("pending", "running")
 
@@ -261,7 +269,7 @@ def aggregate(items: Sequence[Tuple[str, RunMetrics]]) -> AggregateMetrics:
     total_tool_errors = 0
     total_denials = 0
     # program -> mutable accumulator
-    progs: Dict[str, Dict[str, object]] = {}
+    progs: Dict[str, _ProgramAccumulator] = {}
 
     completed = failed = 0
     for program_name, m in items:
@@ -280,21 +288,21 @@ def aggregate(items: Sequence[Tuple[str, RunMetrics]]) -> AggregateMetrics:
 
         p = progs.setdefault(
             program_name,
-            {"runs": 0, "completed": 0, "failed": 0, "_durations": []},
+            {"runs": 0, "completed": 0, "failed": 0, "durations": []},
         )
-        p["runs"] = int(p["runs"]) + 1  # type: ignore[arg-type]
+        p["runs"] += 1
         if status == "completed":
-            p["completed"] = int(p["completed"]) + 1  # type: ignore[arg-type]
+            p["completed"] += 1
         elif status == "failed":
-            p["failed"] = int(p["failed"]) + 1  # type: ignore[arg-type]
+            p["failed"] += 1
         if m.duration_ms is not None:
-            p["_durations"].append(m.duration_ms)  # type: ignore[union-attr]
+            p["durations"].append(m.duration_ms)
 
     by_program: Dict[str, Dict[str, object]] = {}
     for name, p in progs.items():
-        c, f = int(p["completed"]), int(p["failed"])  # type: ignore[arg-type]
+        c, f = p["completed"], p["failed"]
         terminal = c + f
-        ds: List[float] = p.pop("_durations")  # type: ignore[assignment]
+        ds = p["durations"]
         by_program[name] = {
             "runs": p["runs"],
             "completed": c,

@@ -6,13 +6,67 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e '.[dev]'
+      - run: python -m pytest -q
+
+  quality:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -e . pytest
-      - run: pytest
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e '.[dev,anthropic]'
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: mypy src/threadlang
+      - run: bandit -q -r src/threadlang
+      - run: pip-audit
+      - run: python -m build
+      - run: twine check dist/*
+      - name: Install wheel in a clean environment
+        run: |
+          python -m venv /tmp/threadlang-wheel
+          /tmp/threadlang-wheel/bin/pip install dist/*.whl
+          /tmp/threadlang-wheel/bin/threadlang --help
+          /tmp/threadlang-wheel/bin/threadlang-serve --help
+
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t threadlang:ci .
+      - name: Smoke non-root authenticated container
+        run: |
+          docker run -d --name threadlang-ci \
+            -e THREADLANG_AUTH_TOKEN=ci-only-token \
+            threadlang:ci
+          trap 'docker rm -f threadlang-ci' EXIT
+          test "$(docker exec threadlang-ci id -u)" != "0"
+          for attempt in 1 2 3 4 5; do
+            docker exec threadlang-ci python -c \
+              "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/readyz', timeout=2).read()" \
+              && exit 0
+            sleep 1
+          done
+          docker logs threadlang-ci
+          exit 1

@@ -1,5 +1,7 @@
 """ThreadLang package."""
 
+from .control import WorkerPool, process_one
+from .dashboard import render_run_detail, render_run_list
 from .llm import (
     AgentLLMClient,
     AgentTurn,
@@ -11,8 +13,6 @@ from .llm import (
     RouteLLMClient,
     ToolCall,
 )
-from .control import WorkerPool, process_one
-from .dashboard import render_run_detail, render_run_list
 from .metrics import (
     AggregateMetrics,
     RunMetrics,
@@ -24,8 +24,10 @@ from .parser import ParseError, parse_program
 from .probe import ProbeReport, ProbeRunData, StepProbe, probe_report
 from .runtime import RuntimeError, RuntimeResult, run_program
 from .server import make_server, serve
-from .store import DurableRun, RunRecord, RunStore, run_durable
+from .store import DurableRun, RunRecord, RunStore, RunStoreCapacityError, run_durable
 from .tools import FunctionTool, Tool, ToolRegistry, ToolSpec, default_registry
+
+__version__ = "0.12.0"
 
 __all__ = [
     "parse_program",
@@ -34,6 +36,7 @@ __all__ = [
     "RuntimeError",
     "RuntimeResult",
     "RunStore",
+    "RunStoreCapacityError",
     "RunRecord",
     "DurableRun",
     "run_durable",
@@ -66,4 +69,5 @@ __all__ = [
     "FunctionTool",
     "ToolRegistry",
     "default_registry",
+    "__version__",
 ]

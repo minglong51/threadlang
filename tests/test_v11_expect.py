@@ -123,7 +123,7 @@ def test_parse_expect_rejects_bad_rules(rules: str, error_part: str) -> None:
 def test_parse_rejects_multiple_expect_blocks() -> None:
     source = VERDICT_SOURCE.replace(
         'expect {\n          one_of "ship", "hold"\n        }',
-        'expect { nonempty }\n        expect { nonempty }',
+        "expect { nonempty }\n        expect { nonempty }",
     )
     with pytest.raises(ParseError, match="multiple expect blocks"):
         parse_program(source)

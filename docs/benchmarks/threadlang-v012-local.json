@@ -1,0 +1,30 @@
+{
+  "environment": {
+    "machine": "arm64",
+    "platform": "macOS-26.5.2-arm64-arm-64bit",
+    "python": "3.12.13"
+  },
+  "iterations": 500,
+  "scope": "ThreadLang parser and DryRunClient runtime overhead; no live model calls",
+  "warmup": 50,
+  "workloads": {
+    "contract": {
+      "parse_median_ms": 0.0305,
+      "parse_p95_ms": 0.033666,
+      "run_median_ms": 0.003209,
+      "run_p95_ms": 0.003584
+    },
+    "linear": {
+      "parse_median_ms": 0.0581875,
+      "parse_p95_ms": 0.067708,
+      "run_median_ms": 0.005791,
+      "run_p95_ms": 0.006916
+    },
+    "route": {
+      "parse_median_ms": 0.063125,
+      "parse_p95_ms": 0.069375,
+      "run_median_ms": 0.00475,
+      "run_p95_ms": 0.005292
+    }
+  }
+}

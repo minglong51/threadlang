@@ -141,9 +141,7 @@ def _run_metrics_panel(metrics: RunMetrics) -> str:
     if metrics.route_violations:
         chips.append(_metric_chip("route violations", metrics.route_violations, warn=True))
     if metrics.contract_violations:
-        chips.append(
-            _metric_chip("contract violations", metrics.contract_violations, warn=True)
-        )
+        chips.append(_metric_chip("contract violations", metrics.contract_violations, warn=True))
     if metrics.tool_errors:
         chips.append(_metric_chip("tool errors", metrics.tool_errors, warn=True))
     if metrics.denials:
@@ -174,9 +172,7 @@ def _aggregate_panel(agg: AggregateMetrics) -> str:
     return "<div class='metrics'>" + "".join(chips) + "</div>"
 
 
-def render_run_list(
-    runs: List[RunRecord], aggregate: Optional[AggregateMetrics] = None
-) -> str:
+def render_run_list(runs: List[RunRecord], aggregate: Optional[AggregateMetrics] = None) -> str:
     """The run list: every run with its status, newest first. When `aggregate`
     is supplied (the server passes `store.aggregate_metrics()`), a monitoring
     summary panel is rendered above the table."""
@@ -196,9 +192,7 @@ def render_run_list(
         )
     table = (
         "<table><thead><tr><th>Run</th><th>Program</th><th>Status</th>"
-        "<th>Output / error</th></tr></thead><tbody>"
-        + "".join(rows)
-        + "</tbody></table>"
+        "<th>Output / error</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table>"
     )
     summary = _aggregate_panel(aggregate) if aggregate is not None else ""
     # Refresh while any run is still in flight, so the list updates live.
@@ -218,7 +212,7 @@ def render_run_detail(
     if metrics is None:
         metrics = compute_metrics(events, status=record.status)
     head = [
-        f"<p><a href='/'>← all runs</a></p>",
+        "<p><a href='/'>← all runs</a></p>",
         f"<h2 class='mono'>{_esc(record.id)}</h2>",
         f"<p>{_badge(record.status)} &nbsp; <span class='muted'>"
         f"{_esc(record.program_name)}</span></p>",

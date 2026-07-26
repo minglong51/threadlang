@@ -2,3 +2,10 @@ __pycache__/
 .venv/
 dist/
 build/
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+*.db
+*.db-*
+*.worker.lock

@@ -75,13 +75,10 @@ def test_end_to_end_dry_run_calls_a_custom_tool() -> None:
     )
     assert result.output  # produced a drafted reply
     # The agent step must have actually invoked one of the app's tools.
-    tool_calls = [
-        e for e in result.trace
-        if e.phase == "agent" and e.message.startswith("Tool '")
-    ]
-    assert any(
-        e.data.get("tool") in {"classify_priority", "search_kb"} for e in tool_calls
-    ), "the agent step should have called a custom triage tool"
+    tool_calls = [e for e in result.trace if e.phase == "agent" and e.message.startswith("Tool '")]
+    assert any(e.data.get("tool") in {"classify_priority", "search_kb"} for e in tool_calls), (
+        "the agent step should have called a custom triage tool"
+    )
 
 
 def test_durable_queued_path(tmp_path) -> None:

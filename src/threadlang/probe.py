@@ -134,9 +134,7 @@ def probe_report(program: Program, runs: Sequence[ProbeRunData]) -> ProbeReport:
 
     steps: List[StepProbe] = []
     for step in program.steps.steps:
-        outputs = Counter(
-            r.step_outputs[step.name] for r in runs if step.name in r.step_outputs
-        )
+        outputs = Counter(r.step_outputs[step.name] for r in runs if step.name in r.step_outputs)
         kind = _step_kind(step)
         steps.append(
             StepProbe(
@@ -152,9 +150,7 @@ def probe_report(program: Program, runs: Sequence[ProbeRunData]) -> ProbeReport:
     final_outputs = Counter(
         r.output for r in runs if r.status == "completed" and r.output is not None
     )
-    durations = [
-        r.metrics.duration_ms for r in runs if r.metrics.duration_ms is not None
-    ]
+    durations = [r.metrics.duration_ms for r in runs if r.metrics.duration_ms is not None]
 
     return ProbeReport(
         program=program.thread_name,
