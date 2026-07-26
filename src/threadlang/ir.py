@@ -1,9 +1,9 @@
 """Versioned, canonical intermediate representation for ThreadLang programs.
 
-IR v1 is additive and non-executing: it losslessly represents the v0.12 source
-AST for inspection, stable serialization, and definition fingerprints. The
-existing runtime remains authoritative until a differential IR interpreter is
-implemented and verified.
+IR v1 losslessly represents the v0.12 source AST for inspection, stable
+serialization, definition fingerprints, and execution through a strict IR→AST
+compatibility bridge. The existing runtime remains authoritative; a native IR
+interpreter requires a separately reviewed and verified execution contract.
 """
 
 from __future__ import annotations

@@ -97,7 +97,7 @@ Rejected because syntax is the easy part; cancellation, redelivery, migration, a
 ### Slice B — differential compatibility bridge
 
 - Implement an IR→AST compatibility execution entrypoint.
-- Run AST and IR interpreters against identical scripted clients.
+- Run source-AST and IR-bridge entrypoints against identical scripted clients.
 - Compare outputs, step outputs, call order, prompts, and trace semantics.
 - Keep durable production execution on the old interpreter until equivalence is demonstrated.
 
