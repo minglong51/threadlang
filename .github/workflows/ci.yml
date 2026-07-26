@@ -58,7 +58,7 @@ jobs:
       - name: Smoke non-root authenticated container
         run: |
           docker run -d --name threadlang-ci \
-            -e THREADLANG_AUTH_TOKEN=ci-only-token \
+            -e THREADLANG_AUTH_TOKEN=ci-only-token-123456 \
             threadlang:ci
           trap 'docker rm -f threadlang-ci' EXIT
           test "$(docker exec threadlang-ci id -u)" != "0"
