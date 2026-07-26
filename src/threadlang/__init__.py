@@ -2,6 +2,13 @@
 
 from .control import WorkerPool, process_one
 from .dashboard import render_run_detail, render_run_list
+from .ir import (
+    IRCompileError,
+    WorkflowIR,
+    canonical_ir_bytes,
+    compile_program,
+    workflow_fingerprint,
+)
 from .llm import (
     AgentLLMClient,
     AgentTurn,
@@ -32,6 +39,11 @@ __version__ = "0.12.0"
 __all__ = [
     "parse_program",
     "ParseError",
+    "compile_program",
+    "canonical_ir_bytes",
+    "workflow_fingerprint",
+    "WorkflowIR",
+    "IRCompileError",
     "run_program",
     "RuntimeError",
     "RuntimeResult",

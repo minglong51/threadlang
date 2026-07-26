@@ -469,6 +469,10 @@ behind the platform layers below rather than bolted on early.
   `DryRunClient` lets you run any program — agent steps included — without either.
 - Frozen dataclass AST nodes (`src/threadlang/ast.py`); `Step` (llm) and
   `AgentStep` are distinct node types.
+- Experimental canonical Workflow IR v1 (`src/threadlang/ir.py`) losslessly
+  compiles the v0.12 AST into deterministic JSON and a SHA-256 definition
+  fingerprint. It is additive and non-executing: the AST runtime remains
+  authoritative while differential execution is designed and tested.
 - Parser (`src/threadlang/parser.py`) — a position-aware lexer and
   recursive-descent parser with string/comment-aware delimiters, full-input
   consumption, static graph/reference validation, and line/column diagnostics.
