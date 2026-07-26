@@ -1,7 +1,8 @@
 # ThreadLang — Low-Level Design
 
-Reverse-engineered from source at v0.8.0. Line references are `file:line` into
-`src/threadlang/` unless another root is given.
+Refreshed for v0.12. The supported boundary is one POSIX process and one local
+SQLite store; see [`../production.md`](../production.md). Historical line
+references elsewhere in this document are explanatory and not API contracts.
 
 ## Module Breakdown
 
@@ -23,33 +24,17 @@ Frozen dataclasses (immutable) shared by parser and runtime:
   `kind ∈ {"text","llm"}`; `model` only for `llm` (`ast.py:86`)
 - `Program(thread_name, context, steps, emit)` (`ast.py:100`)
 
-### `parser.py` — regex + brace-balanced parser
+### `parser.py` — position-aware recursive-descent parser
 
-- `parse_program(source: str) -> Program` (`parser.py:74`) — full-matches
-  `_THREAD_RE` for `thread <Name> { ... }`, then dispatches to the block
-  parsers. `ParseError(ValueError)` (`parser.py:47`).
-- `_parse_context_block(body) -> ContextBlock` (`parser.py:94`) — required;
-  each non-blank line must full-match `name = "value"` (`parser.py:104`).
-- `_extract_braced(text, brace_index) -> (inner, close_index)` (`parser.py:114`)
-  — depth-counting scan; raises on unbalanced braces. Needed because agent
-  bodies nest deeper than a fixed regex can track (`parser.py:55`).
-- `_parse_steps_block(body) -> StepsBlock` (`parser.py:129`) — optional block.
-  Locates `steps {` by keyword, carves the body, then iterates
-  `step <name> {` heads carving each body; rejects duplicate names
-  (`parser.py:145`) and a non-empty block with no valid step (`parser.py:153`).
-- `_parse_step_body(name, body) -> StepNode` (`parser.py:167`) — dispatches on
-  `llm "<model>" { ... }` vs `agent "<model>" { ... }` full-match.
-- `_parse_agent_step(name, model, inner) -> AgentStep` (`parser.py:185`) —
-  extracts optional `tools [a, b]` (names validated against `_IDENT_RE`,
-  `parser.py:193`) and optional `max_iters N` (`>= 1`, `parser.py:202`;
-  default `DEFAULT_MAX_ITERS = 6`, `parser.py:44`); the remainder is the prompt
-  expression.
-- `_parse_emit_block(body) -> EmitBlock` (`parser.py:218`) — tries
-  `emit llm "<model>" { ... }` first, then `emit text { ... }`; multi-line
-  expression text is joined to one line; missing/empty raises.
-- `_parse_expression(text) -> Expression` (`parser.py:248`) — splits on `+`,
-  classifies each term by full-match into the four term types; anything else
-  raises `ParseError` (`parser.py:264`).
+- `_lex(source)` emits typed tokens carrying offsets, lines, and columns. It is
+  string/comment aware and enforces source/string limits before parsing.
+- `_Parser.parse()` consumes exactly one `thread` declaration and rejects every
+  trailing or unrecognized token rather than scanning past it.
+- Dedicated context, steps, llm, agent, route, contract, emit, and expression
+  productions build the frozen AST without regex carving.
+- Static validation rejects duplicates, excessive `max_iters`, unavailable
+  `steps.*` references, backward/unknown graph targets, and duplicate route
+  labels. `ParseError` includes source position.
 
 ### `runtime.py` — interpreter
 

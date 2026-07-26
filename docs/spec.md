@@ -1,4 +1,4 @@
-# ThreadLang Specification (v1)
+# ThreadLang Specification (language v1, runtime v0.13)
 
 ## Overview
 
@@ -63,6 +63,20 @@ term        = string | "context." name | "inputs." name
   to the model; response becomes the program output).
 - Step names within a single `steps` block must be unique. `end` is a
   reserved jump target and cannot be a step name.
+- Source, string, step-count, expression, contract, and `max_iters` limits are
+  normative fail-closed runtime policy. Programs exceeding them are invalid.
+- Comments and delimiters inside quoted strings are lexical content, not
+  structure. The parser consumes all input and reports line/column errors.
+
+### Durability and deployment (v0.13)
+
+The language semantics are independent of storage. The bundled durable runtime
+provides step-boundary checkpoints on one POSIX process and one local SQLite
+store. It binds a run to hashes of its source and canonical inputs and rejects
+concurrent resume with a compare-and-swap transition. A hard crash may repeat
+the current incomplete LLM/agent step; this is not deterministic event-history
+replay. Side-effecting tools must be declared idempotent to run durably. The
+full operational contract is [`production.md`](production.md).
 
 ### Step graph (v0.9)
 

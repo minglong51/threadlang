@@ -97,9 +97,7 @@ def test_resume_skips_completed_step_after_crash(tmp_path: Path) -> None:
     assert len(a_calls_before) == 1
 
     # Resume: step a must NOT re-run (reused from checkpoint); step b succeeds now.
-    durable = run_durable(
-        program, {"x": "hello"}, store, llm_client=client, run_id=failed_id
-    )
+    durable = run_durable(program, {"x": "hello"}, store, llm_client=client, run_id=failed_id)
     assert durable.run_id == failed_id
     assert store.get_run(failed_id).status == "completed"  # type: ignore[union-attr]
     assert set(store.load_step_outputs(failed_id)) == {"a", "b"}
@@ -126,4 +124,60 @@ def test_completed_run_replays_without_reexecuting(tmp_path: Path) -> None:
     replay = run_durable(program, {"x": "hi"}, store, llm_client=client, run_id=first.run_id)
     assert replay.result.output == first.result.output
     assert client.calls == [], "a completed run must replay from the store, not re-execute"
+    store.close()
+
+
+def test_resume_rejects_program_or_input_identity_drift(tmp_path: Path) -> None:
+    store = RunStore(str(tmp_path / "runs.db"))
+    program = parse_program(_TWO_STEP)
+    completed = run_durable(program, {"x": "hi"}, store, llm_client=DryRunClient())
+
+    changed_program = parse_program(_TWO_STEP.replace('"A:"', '"CHANGED:"'))
+    with pytest.raises(ValueError, match="program source does not match"):
+        run_durable(
+            changed_program,
+            {"x": "hi"},
+            store,
+            llm_client=DryRunClient(),
+            run_id=completed.run_id,
+        )
+    with pytest.raises(ValueError, match="inputs do not match"):
+        run_durable(
+            program,
+            {"x": "different"},
+            store,
+            llm_client=DryRunClient(),
+            run_id=completed.run_id,
+        )
+    store.close()
+
+
+def test_resume_rejects_an_already_active_run(tmp_path: Path) -> None:
+    program = parse_program(_TWO_STEP)
+    store = RunStore(str(tmp_path / "runs.db"))
+    run_id = store.create_run(program.thread_name, {"x": "hello"})
+    store.mark_running(run_id, expected="created")
+
+    with pytest.raises(ValueError, match="already active"):
+        run_durable(program, {"x": "hello"}, store, run_id=run_id)
+    store.close()
+
+
+def test_legacy_failed_run_without_source_identity_cannot_resume(tmp_path: Path) -> None:
+    program = parse_program(_TWO_STEP)
+    store = RunStore(str(tmp_path / "runs.db"))
+    run_id = store.create_run(program.thread_name, {"x": "hello"})
+    store.mark_running(run_id, expected="created")
+    store.save_step_output(run_id, "first", "checkpoint")
+    store.mark_failed(run_id, "legacy crash")
+
+    with pytest.raises(ValueError, match="no verifiable program identity"):
+        run_durable(program, {"x": "hello"}, store, run_id=run_id, source=_TWO_STEP)
+    store.close()
+
+
+def test_store_enables_wal_and_foreign_keys(tmp_path: Path) -> None:
+    store = RunStore(str(tmp_path / "runs.db"))
+    assert store._conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    assert store._conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
     store.close()

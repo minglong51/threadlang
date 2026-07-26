@@ -457,8 +457,9 @@ Full grammar in [`docs/grammar.ebnf`](docs/grammar.ebnf); semantics in
 
 Still narrow on purpose: no cycles/recursion (branching is forward-only —
 iteration lives inside `agent` steps, bounded by `max_iters`), no streaming,
-no system prompts, no real type system, and tools are pure functions with no
-sandbox or resource limits. Each is a real addition with its own design surface, sequenced
+no system prompts, no real type system, and no sandbox for arbitrary custom
+Python tool implementations. Durable execution rejects tools declared as both
+side-effecting and non-idempotent. Each broader capability is a real addition with its own design surface, sequenced
 behind the platform layers below rather than bolted on early.
 
 ## Project shape
@@ -468,10 +469,14 @@ behind the platform layers below rather than bolted on early.
   `DryRunClient` lets you run any program — agent steps included — without either.
 - Frozen dataclass AST nodes (`src/threadlang/ast.py`); `Step` (llm) and
   `AgentStep` are distinct node types.
-- Parser (`src/threadlang/parser.py`) — regex for the flat blocks, plus a
-  brace-balanced scan for steps so `llm` and `agent` bodies interleave in
-  declaration order. (A hand-written recursive-descent parser is the next
-  move when control flow lands.)
+- Canonical Workflow IR v1 (`src/threadlang/ir.py`) losslessly compiles the
+  v0.12 AST into deterministic JSON and a SHA-256 definition fingerprint. It
+  supports strict untrusted-JSON loading and compatibility execution through an
+  explicit IR→AST bridge. New durable runs bind and integrity-check the stored
+  canonical definition; the established AST interpreter remains authoritative.
+- Parser (`src/threadlang/parser.py`) — a position-aware lexer and
+  recursive-descent parser with string/comment-aware delimiters, full-input
+  consumption, static graph/reference validation, and line/column diagnostics.
 - Deterministic runtime (`src/threadlang/runtime.py`) returns
   `(output, trace, step_outputs)`. Every binding, step call, agent turn, tool
   call, and tool result appends a `TraceEvent`.
@@ -527,6 +532,14 @@ The remaining layers each keep the determinism/trace bet:
    llm steps (one_of / matches / max_chars / nonempty), enforced with one
    feedback retry and failing loud; violations are trace events that metrics
    and probes fold.
+10. **Bounded production profile** *(v0.12)* — fail-closed resource policy,
+    parser hardening, authenticated single-node control plane, source/input
+    integrity binding, exclusive worker ownership, CAS resume, packaging,
+    security gates, and a non-root container. The support boundary is one POSIX
+    process and one local SQLite store; LLM calls remain at-least-once across a
+    hard crash. See [`docs/production.md`](docs/production.md),
+    [`SECURITY.md`](SECURITY.md), and the
+    [semantic comparison](docs/benchmarks/dsl-comparison.md).
 
 ## License
 

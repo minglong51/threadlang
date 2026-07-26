@@ -151,8 +151,14 @@ def test_tokens_none_when_no_usage() -> None:
 
 def test_tokens_summed_from_usage_events() -> None:
     trace = [
-        TraceEvent("step", "Calling LLM for step 'a'", {"usage": {"input_tokens": 10, "output_tokens": 4}}),
-        TraceEvent("step", "Step 'a' produced output", {"step": "a", "usage": {"input_tokens": 2, "output_tokens": 1}}),
+        TraceEvent(
+            "step", "Calling LLM for step 'a'", {"usage": {"input_tokens": 10, "output_tokens": 4}}
+        ),
+        TraceEvent(
+            "step",
+            "Step 'a' produced output",
+            {"step": "a", "usage": {"input_tokens": 2, "output_tokens": 1}},
+        ),
     ]
     m = compute_metrics(trace)
     assert m.input_tokens == 12
@@ -256,13 +262,42 @@ def test_migrates_store_without_ts_column(tmp_path: Path) -> None:
           PRIMARY KEY (run_id, step_name));
         """
     )
+    conn.execute(
+        "INSERT INTO runs (id, program_name, status, inputs_json, source, output, error, "
+        "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "legacy-run",
+            "Legacy",
+            "completed",
+            "{}",
+            'thread Legacy { context {} emit text { "ok" } }',
+            "ok",
+            None,
+            "2026-01-01T00:00:00+00:00",
+            "2026-01-01T00:00:00+00:00",
+        ),
+    )
+    conn.commit()
     conn.close()
 
-    # Opening it should add the ts column and a fresh run should work end-to-end.
+    # Opening it should add every newer column without losing the legacy row,
+    # and a fresh definition-bound run should work end-to-end.
     store = RunStore(str(db))
     cols = {r["name"] for r in store._conn.execute("PRAGMA table_info(events)").fetchall()}
     assert "ts" in cols
+    run_cols = {r["name"] for r in store._conn.execute("PRAGMA table_info(runs)").fetchall()}
+    assert {
+        "program_sha256",
+        "inputs_sha256",
+        "definition_json",
+        "definition_sha256",
+        "ir_version",
+    } <= run_cols
+    legacy = store.get_run("legacy-run")
+    assert legacy is not None and legacy.output == "ok"
+    assert legacy.definition_json is None and legacy.definition_sha256 is None
     durable = run_durable(parse_program(_TWO_STEP), {"x": "y"}, store, llm_client=DryRunClient())
+    assert store.get_run(durable.run_id).definition_json is not None  # type: ignore[union-attr]
     assert store.run_metrics(durable.run_id) is not None
     store.close()
 
@@ -274,9 +309,7 @@ def test_trace_span_needs_two_timestamps() -> None:
     assert trace_span_ms([]) is None
     assert trace_span_ms(["2026-06-06T00:00:00+00:00"]) is None
     assert trace_span_ms([None, None]) is None
-    span = trace_span_ms(
-        ["2026-06-06T00:00:00+00:00", "2026-06-06T00:00:01+00:00"]
-    )
+    span = trace_span_ms(["2026-06-06T00:00:00+00:00", "2026-06-06T00:00:01+00:00"])
     assert span is not None and abs(span - 1000.0) < 1.0
 
 
@@ -287,7 +320,9 @@ def test_dashboard_renders_run_metrics(tmp_path: Path) -> None:
     store = RunStore(str(tmp_path / "runs.db"))
     durable = run_durable(parse_program(_TWO_STEP), {"x": "hi"}, store, llm_client=DryRunClient())
     record = store.get_run(durable.run_id)
-    html = render_run_detail(record, store.load_events(durable.run_id), store.run_metrics(durable.run_id))
+    html = render_run_detail(
+        record, store.load_events(durable.run_id), store.run_metrics(durable.run_id)
+    )
     assert "class='metrics'" in html
     assert "steps" in html
     # aggregate panel on the run list
@@ -301,8 +336,13 @@ def test_run_detail_metrics_optional_without_store() -> None:
     from threadlang.store import RunRecord
 
     rec = RunRecord(
-        id="x", program_name="P", status="completed",
-        inputs={}, output="o", error=None, source=None,
+        id="x",
+        program_name="P",
+        status="completed",
+        inputs={},
+        output="o",
+        error=None,
+        source=None,
     )
     events = [TraceEvent("step", "Step 'a' produced output", {"step": "a"})]
     html = render_run_detail(rec, events)  # no metrics arg

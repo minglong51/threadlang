@@ -72,8 +72,11 @@ def _probe_store(tmp_path: Path, scripts: Sequence[Sequence[str]]) -> tuple:
         run_id = store.create_run(program.thread_name, {"task": "x"})
         try:
             run_durable(
-                program, {"task": "x"}, store,
-                llm_client=ScriptedClient(script), run_id=run_id,
+                program,
+                {"task": "x"},
+                store,
+                llm_client=ScriptedClient(script),
+                run_id=run_id,
             )
         except TLRuntimeError:
             pass
@@ -93,11 +96,11 @@ def test_probe_folds_mixed_runs(tmp_path: Path) -> None:
     program, runs = _probe_store(
         tmp_path,
         [
-            ["math", "42"],            # → solve
-            ["writing", "a poem"],     # → draft
-            ["math", "42"],            # → solve, same output
+            ["math", "42"],  # → solve
+            ["writing", "a poem"],  # → draft
+            ["math", "42"],  # → solve, same output
             ["banana", "math", "43"],  # violation, retry matches → solve
-            ["writing"],               # → draft, then the draft call dies
+            ["writing"],  # → draft, then the draft call dies
         ],
     )
     report = probe_report(program, runs)

@@ -21,10 +21,14 @@ itself is stateless across runs.
 
 from __future__ import annotations
 
+import json
+
+# Subprocess is intentional: an isolated interpreter gives stdlib regexes a
+# killable deadline. The executable/argv are fixed and shell=False.
+import subprocess  # nosec B404
+import sys
 from dataclasses import dataclass
 from typing import Callable, Dict, Mapping, Optional
-
-import re
 
 from .ast import (
     END_TARGET,
@@ -41,12 +45,59 @@ from .ast import (
     StringLiteral,
 )
 from .llm import DryRunClient, LLMClient, Message
+from .policy import MAX_REGEX_INPUT_CHARS, REGEX_TIMEOUT_SECONDS
 from .tools import ToolRegistry, default_registry
 from .trace import DenialCode, Trace, TraceEvent
 
 
 class RuntimeError(ValueError):
     """Raised when runtime execution fails deterministically."""
+
+
+_REGEX_RUNNER = r"""
+import json
+import re
+import sys
+try:
+    import resource
+    limit = 256 * 1024 * 1024
+    resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+except (ImportError, OSError, ValueError):
+    pass
+pattern, value = json.loads(sys.stdin.read())
+raise SystemExit(0 if re.fullmatch(pattern, value) is not None else 1)
+"""
+
+
+def _safe_regex_fullmatch(pattern: str, value: str) -> bool:
+    """Evaluate an untrusted regex in a killable isolated interpreter.
+
+    Python's stdlib regex engine has no timeout and a worker thread cannot be
+    killed safely. A short-lived isolated child is acceptable next to an LLM
+    call and gives the control plane a real wall-clock bound without adding a
+    package dependency. Exit 0 means match, 1 means no match; all other outcomes
+    fail closed as runtime policy errors.
+    """
+    if len(value) > MAX_REGEX_INPUT_CHARS:
+        raise RuntimeError(f"regex contract input exceeds {MAX_REGEX_INPUT_CHARS} characters")
+    try:
+        # Untrusted pattern/data travel over stdin, never argv or a shell.
+        completed = subprocess.run(  # nosec B603
+            [sys.executable, "-I", "-c", _REGEX_RUNNER],
+            input=json.dumps([pattern, value]),
+            text=True,
+            capture_output=True,
+            timeout=REGEX_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"regex contract exceeded {REGEX_TIMEOUT_SECONDS:.1f}s evaluation limit"
+        ) from exc
+    if completed.returncode in (0, 1):
+        return completed.returncode == 0
+    detail = completed.stderr.strip()[:200]
+    raise RuntimeError("regex contract evaluator failed" + (f": {detail}" if detail else ""))
 
 
 @dataclass(frozen=True)
@@ -95,12 +146,8 @@ def run_program(
         program, context, inputs, client, registry, trace, resume_outputs, on_step_complete
     )
 
-    output = _evaluate_emit(
-        program.emit, context, inputs, step_outputs, client, trace
-    )
-    trace.append(
-        TraceEvent(phase="emit", message="Output emitted", data={"output": output})
-    )
+    output = _evaluate_emit(program.emit, context, inputs, step_outputs, client, trace)
+    trace.append(TraceEvent(phase="emit", message="Output emitted", data={"output": output}))
     return RuntimeResult(output=output, trace=trace, step_outputs=dict(step_outputs))
 
 
@@ -140,6 +187,8 @@ def _run_steps(
             # its output instead of re-running it. The skip is itself traced.
             # A resumed route step re-derives its jump from the stored label
             # below — deterministically, with no model call.
+            if resume_outputs is None:
+                raise RuntimeError("internal error: resumed step has no checkpoint map")
             output = resume_outputs[step.name]
             trace.append(
                 TraceEvent(
@@ -153,16 +202,11 @@ def _run_steps(
             output = _run_route_step(step, context, inputs, step_outputs, client, trace)
             step_outputs[step.name] = output
         elif isinstance(step, AgentStep):
-            output = _run_agent_step(
-                step, context, inputs, step_outputs, client, registry, trace
-            )
+            output = _run_agent_step(step, context, inputs, step_outputs, client, registry, trace)
             step_outputs[step.name] = output
         else:
             output = _run_llm_step(step, context, inputs, step_outputs, client, trace)
             step_outputs[step.name] = output
-        if not resumed and on_step_complete is not None:
-            on_step_complete(step.name, output)
-
         # Follow the step's outgoing edge. Arm dispatch is deterministic code:
         # the model only picked the label, the transition is decided here.
         if isinstance(step, RouteStep):
@@ -186,6 +230,11 @@ def _run_steps(
             )
         else:
             target = step.next_target
+        # Persist only after all output validation and route resolution has
+        # succeeded. Otherwise an invalid route label would poison the
+        # checkpoint and every resume would deterministically reuse it.
+        if not resumed and on_step_complete is not None:
+            on_step_complete(step.name, output)
         if target is None:
             i += 1
         elif target == END_TARGET:
@@ -218,9 +267,7 @@ def _contract_text(rules: tuple[ExpectRule, ...]) -> str:
                 + ". Output only the label — no other text."
             )
         elif rule.kind == "matches":
-            lines.append(
-                f"Your entire reply must match this regular expression: {rule.pattern}"
-            )
+            lines.append(f"Your entire reply must match this regular expression: {rule.pattern}")
         elif rule.kind == "max_chars":
             lines.append(f"Reply with at most {rule.limit} characters.")
         elif rule.kind == "nonempty":
@@ -228,9 +275,7 @@ def _contract_text(rules: tuple[ExpectRule, ...]) -> str:
     return "\n".join(lines)
 
 
-def _check_expect(
-    rules: tuple[ExpectRule, ...], response: str
-) -> tuple[str, list[str]]:
+def _check_expect(rules: tuple[ExpectRule, ...], response: str) -> tuple[str, list[str]]:
     """Evaluate a reply against an expect contract. Returns (output,
     violations): the output a passing reply binds — whitespace-stripped, and
     canonicalized to the matching value for `one_of` (same normalization as
@@ -254,15 +299,15 @@ def _check_expect(
         if rule.kind == "one_of":
             pass
         elif rule.kind == "matches":
-            assert rule.pattern is not None
-            if re.fullmatch(rule.pattern, output) is None:
+            if rule.pattern is None:
+                raise RuntimeError("internal error: matches contract has no pattern")
+            if not _safe_regex_fullmatch(rule.pattern, output):
                 violations.append(f"reply does not match the pattern: {rule.pattern}")
         elif rule.kind == "max_chars":
-            assert rule.limit is not None
+            if rule.limit is None:
+                raise RuntimeError("internal error: max_chars contract has no limit")
             if len(output) > rule.limit:
-                violations.append(
-                    f"reply is {len(output)} characters; max_chars is {rule.limit}"
-                )
+                violations.append(f"reply is {len(output)} characters; max_chars is {rule.limit}")
         elif rule.kind == "nonempty":
             if not output:
                 violations.append("reply is empty")
@@ -297,7 +342,8 @@ def _run_llm_step(
         )
         try:
             if route_fn is not None:
-                assert one_of is not None
+                if one_of is None:
+                    raise RuntimeError("internal error: route contract has no labels")
                 return route_fn(model=step.model, prompt=p, options=list(one_of.values))
             return client.complete(model=step.model, prompt=p)
         except Exception as exc:
@@ -438,8 +484,7 @@ def _run_route_step(
         )
     )
     retry_prompt = (
-        f"{full_prompt}\n\nYour previous reply was not one of the allowed labels. "
-        + contract
+        f"{full_prompt}\n\nYour previous reply was not one of the allowed labels. " + contract
     )
     response = ask(retry_prompt, attempt=2)
     label = _normalize_route_output(response, by_normalized)
@@ -479,9 +524,7 @@ def _run_agent_step(
 
     for tool_name in step.tools:
         if not registry.has(tool_name):
-            raise RuntimeError(
-                f"agent step '{step.name}' references unknown tool: {tool_name}"
-            )
+            raise RuntimeError(f"agent step '{step.name}' references unknown tool: {tool_name}")
     specs = registry.specs(list(step.tools))
     allowed = set(step.tools)
 
@@ -518,8 +561,7 @@ def _run_agent_step(
                     "turn": turn,
                     "text": response.text,
                     "tool_calls": [
-                        {"name": c.name, "arguments": c.arguments}
-                        for c in response.tool_calls
+                        {"name": c.name, "arguments": c.arguments} for c in response.tool_calls
                     ],
                 },
             )
@@ -576,9 +618,7 @@ def _run_agent_step(
                         },
                     )
                 )
-            messages.append(
-                {"role": "tool", "tool_call_id": call.id, "content": result}
-            )
+            messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
 
     raise RuntimeError(
         f"agent step '{step.name}' exceeded max_iters ({step.max_iters}) without a final answer"
@@ -597,7 +637,8 @@ def _evaluate_emit(
         return _render_expression(emit.expression, context, inputs, step_outputs, trace=trace)
     if emit.kind == "llm":
         prompt = _render_expression(emit.expression, context, inputs, step_outputs)
-        assert emit.model is not None, "parser invariant: emit llm must carry a model"
+        if emit.model is None:
+            raise RuntimeError("internal error: emit llm has no model")
         trace.append(
             TraceEvent(
                 phase="emit",
@@ -608,9 +649,7 @@ def _evaluate_emit(
         try:
             return client.complete(model=emit.model, prompt=prompt)
         except Exception as exc:
-            raise RuntimeError(
-                f"LLM call failed during emit: {type(exc).__name__}: {exc}"
-            ) from exc
+            raise RuntimeError(f"LLM call failed during emit: {type(exc).__name__}: {exc}") from exc
     raise RuntimeError(f"Unknown emit kind: {emit.kind}")
 
 
@@ -641,7 +680,7 @@ def _render_expression(
                 if not term.optional:
                     raise RuntimeError(
                         f"Reference to step '{term.step_name}' before it ran "
-                        f"(a step skipped by routing renders as \"\" only via "
+                        f'(a step skipped by routing renders as "" only via '
                         f"steps.{term.step_name}.output?)"
                     )
                 value = ""

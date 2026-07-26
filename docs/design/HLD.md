@@ -1,6 +1,11 @@
 # ThreadLang — High-Level Design
 
-*Refreshed against v0.8.0 (`pyproject.toml:7`). Line references are current source.*
+*Refreshed for v0.12. Source line numbers are intentionally omitted where they
+would make the design document brittle.*
+
+The supported production boundary is one POSIX process and one local SQLite
+store. "Durable" below means step-boundary checkpoints and crash recovery, not
+deterministic event-history replay. See [`../production.md`](../production.md).
 
 ## Purpose
 
@@ -62,8 +67,9 @@ JS build (server-rendered HTML with inline CSS, `dashboard.py:9`).
 | Path | Responsibility |
 |------|----------------|
 | `src/threadlang/__init__.py` | Public API surface — re-exports the whole stack: parse/run, store/durable, control plane, server, dashboard renderers, metrics, clients, tools (`__init__.py:28`). |
-| `src/threadlang/ast.py` | Frozen-dataclass AST: `Program`, `ContextBlock`, `Step` (llm) and `AgentStep` as distinct node types, `EmitBlock`, expression terms. Parser↔runtime contract. |
-| `src/threadlang/parser.py` | Regex + brace-balanced-scan parser. `parse_program(source) -> Program`; steps are carved with `_extract_braced` so mixed `llm`/`agent` bodies keep declaration order (`parser.py:114`, `parser.py:129`). Raises `ParseError`. |
+| `src/threadlang/ast.py` | Frozen-dataclass source AST: `Program`, `ContextBlock`, `Step` (llm) and `AgentStep` as distinct node types, `EmitBlock`, expression terms. Parser↔current-runtime contract. |
+| `src/threadlang/ir.py` | Experimental non-executing Workflow IR v1 compiler. Produces immutable tagged nodes, canonical JSON bytes, and a SHA-256 definition fingerprint without changing the current AST runtime. See `v013-architecture-proposal.md`. |
+| `src/threadlang/parser.py` | Position-aware lexer and recursive-descent parser. It consumes all source, handles strings/comments structurally, validates graph/reference availability, and raises line/column `ParseError` diagnostics. |
 | `src/threadlang/runtime.py` | Deterministic interpreter. `run_program(...) -> RuntimeResult`; runs llm steps, agent tool-use loops (allow-list enforced, denials traced), and emit. Storage-agnostic durability hooks (`trace`, `resume_outputs`, `on_step_complete`, `runtime.py:57`). |
 | `src/threadlang/llm.py` | Client backends behind two protocols: `LLMClient.complete` and `AgentLLMClient.agent_step`. `DryRunClient` (deterministic echo + two-phase agent stub), `OpenAICompatClient` (stdlib HTTP), `AnthropicClient` (SDK). |
 | `src/threadlang/tools.py` | The agent execution boundary: `ToolSpec`/`Tool`/`FunctionTool`, `ToolRegistry` allow-list, deterministic built-ins `echo` + `calculator` (AST-walked arithmetic, no `eval`, no `**`, `tools.py:111`). |

@@ -19,9 +19,13 @@ is built from; it is fully testable without threads or sockets.
 
 from __future__ import annotations
 
+import fcntl
+import json
+import sys
 import threading
-from typing import Optional
+from typing import IO, Optional
 
+from .ir import load_ir_bytes, program_from_ir
 from .llm import LLMClient
 from .parser import parse_program
 from .store import DurableRun, RunStore, run_durable
@@ -41,9 +45,17 @@ def process_one(
     claimed = store.claim_next_pending()
     if claimed is None:
         return None
-    assert claimed.source is not None, "enqueued runs always carry their source"
-    program = parse_program(claimed.source)
+    if claimed.source is None and claimed.definition_json is None:
+        store.mark_failed(claimed.id, "InvariantError: enqueued run has no workflow definition")
+        return None
     try:
+        if claimed.definition_json is not None:
+            program = program_from_ir(load_ir_bytes(claimed.definition_json.encode("utf-8")))
+        else:
+            source = claimed.source
+            if source is None:
+                raise RuntimeError("enqueued run has no workflow definition")
+            program = parse_program(source)
         return run_durable(
             program,
             claimed.inputs,
@@ -51,10 +63,14 @@ def process_one(
             llm_client=llm_client,
             tools=tools,
             run_id=claimed.id,
+            source=claimed.source,
+            claimed=True,
         )
-    except Exception:
-        # run_durable has marked the run failed and persisted the error; keep
-        # the worker alive to take the next run.
+    except Exception as exc:
+        # Parse failures happen before run_durable can record them. Runtime
+        # failures are already marked failed; updating again is harmless and
+        # guarantees malformed persisted source cannot kill a worker.
+        store.mark_failed(claimed.id, f"{type(exc).__name__}: {str(exc)[:1000]}")
         return None
 
 
@@ -83,13 +99,38 @@ class WorkerPool:
         self._poll_interval = poll_interval
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
+        self._lock_file: Optional[IO[str]] = None
+
+    def _acquire_store_lock(self) -> None:
+        lock_file = open(f"{self._store_path}.worker.lock", "a+", encoding="utf-8")
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            lock_file.close()
+            raise RuntimeError("another ThreadLang worker pool owns this store") from exc
+        self._lock_file = lock_file
+
+    def _release_store_lock(self) -> None:
+        if self._lock_file is not None:
+            fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)
+            self._lock_file.close()
+            self._lock_file = None
 
     def start(self) -> None:
-        store = RunStore(self._store_path)
+        if self._threads:
+            raise RuntimeError("worker pool is already started")
+        if self._n_workers < 1:
+            raise ValueError("n_workers must be >= 1")
+        self._acquire_store_lock()
         try:
-            store.requeue_orphans()
-        finally:
-            store.close()
+            store = RunStore(self._store_path)
+            try:
+                store.requeue_orphans()
+            finally:
+                store.close()
+        except Exception:
+            self._release_store_lock()
+            raise
         for i in range(self._n_workers):
             t = threading.Thread(target=self._loop, name=f"tl-worker-{i}", daemon=True)
             t.start()
@@ -99,9 +140,25 @@ class WorkerPool:
         store = RunStore(self._store_path)
         try:
             while not self._stop.is_set():
-                durable = process_one(
-                    store, llm_client=self._llm_client, tools=self._tools
-                )
+                try:
+                    durable = process_one(store, llm_client=self._llm_client, tools=self._tools)
+                except Exception as exc:
+                    # Store/provider infrastructure faults should be observable
+                    # through readiness, but a transient sqlite lock or client
+                    # bug must not terminate the thread permanently.
+                    print(
+                        json.dumps(
+                            {
+                                "component": "threadlang-worker",
+                                "worker": threading.current_thread().name,
+                                "error_type": type(exc).__name__,
+                            },
+                            separators=(",", ":"),
+                        ),
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    durable = None
                 if durable is None:
                     # Queue empty — wait briefly (interruptible) before polling.
                     self._stop.wait(self._poll_interval)
@@ -113,6 +170,23 @@ class WorkerPool:
         for t in self._threads:
             t.join(timeout=timeout)
         self._threads.clear()
+        self._release_store_lock()
+
+    def is_healthy(self) -> bool:
+        """True only while every configured worker thread is alive."""
+        return (
+            bool(self._threads)
+            and len(self._threads) == self._n_workers
+            and all(thread.is_alive() for thread in self._threads)
+            and not self._stop.is_set()
+        )
+
+    def status(self) -> dict[str, object]:
+        return {
+            "configured": self._n_workers,
+            "alive": sum(thread.is_alive() for thread in self._threads),
+            "healthy": self.is_healthy(),
+        }
 
     def drain(self, store: RunStore, *, max_runs: int = 10_000) -> int:
         """Synchronously process pending runs until the queue is empty (or
@@ -121,8 +195,15 @@ class WorkerPool:
         were processed."""
         count = 0
         while count < max_runs:
+            pending_before = store.counts_by_status().get("pending", 0)
+            if pending_before == 0:
+                break
             durable = process_one(store, llm_client=self._llm_client, tools=self._tools)
             if durable is None:
-                break
+                # None can mean either an empty queue or a run that was claimed
+                # and failed. The pre-claim count distinguishes those cases so
+                # one bad job cannot prevent later jobs from draining.
+                count += 1
+                continue
             count += 1
         return count

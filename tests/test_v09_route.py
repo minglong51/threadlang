@@ -31,7 +31,7 @@ from threadlang.runtime import RuntimeError as TLRuntimeError, run_program  # no
 from threadlang.store import RunStore, run_durable  # noqa: E402
 
 
-def _route_source(else_clause: str = 'else -> draft') -> str:
+def _route_source(else_clause: str = "else -> draft") -> str:
     return f"""
     thread RouteDemo {{
       context {{}}
@@ -274,16 +274,35 @@ def test_resume_re_derives_route_jump_without_model_call(tmp_path: Path) -> None
     # Resume: the route's stored label re-derives the jump; the only model
     # call is the incomplete draft step.
     resumed = run_durable(
-        program, {"task": "poem"}, store,
-        llm_client=ScriptedClient(["drafted"]), run_id=run_id,
+        program,
+        {"task": "poem"},
+        store,
+        llm_client=ScriptedClient(["drafted"]),
+        run_id=run_id,
     )
     assert resumed.result.output == "drafted"
     assert store.get_run(run_id).status == "completed"
-    decision = [
-        e for e in resumed.result.trace
-        if e.phase == "route" and " chose " in e.message
-    ]
+    decision = [e for e in resumed.result.trace if e.phase == "route" and " chose " in e.message]
     assert decision and decision[0].data["resumed"] is True
+
+
+def test_invalid_route_output_is_not_checkpointed(tmp_path: Path) -> None:
+    source = _route_source(else_clause="")
+    program = parse_program(source)
+    store = RunStore(str(tmp_path / "runs.db"))
+    run_id = store.create_run(program.thread_name, {"task": "x"})
+
+    with pytest.raises(TLRuntimeError, match="matches no arm"):
+        run_durable(
+            program,
+            {"task": "x"},
+            store,
+            llm_client=ScriptedClient(["invalid", "invalid"]),
+            run_id=run_id,
+        )
+
+    assert "route" not in store.load_step_outputs(run_id)
+    store.close()
 
 
 def test_completed_route_run_replays_without_any_model_call(tmp_path: Path) -> None:
@@ -291,8 +310,11 @@ def test_completed_route_run_replays_without_any_model_call(tmp_path: Path) -> N
     store = RunStore(str(tmp_path / "runs.db"))
     first = run_durable(program, {"task": "2+2"}, store, llm_client=DryRunClient())
     replay = run_durable(
-        program, {"task": "2+2"}, store,
-        llm_client=ExplodingClient(), run_id=first.run_id,
+        program,
+        {"task": "2+2"},
+        store,
+        llm_client=ExplodingClient(),
+        run_id=first.run_id,
     )
     assert replay.result.output == first.result.output
 

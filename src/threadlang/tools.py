@@ -38,10 +38,13 @@ class ToolSpec:
     name: str
     description: str
     parameters: Dict[str, object]
+    side_effects: bool = False
+    idempotent: bool = True
 
 
 class Tool(Protocol):
-    spec: ToolSpec
+    @property
+    def spec(self) -> ToolSpec: ...
 
     def run(self, args: Mapping[str, object]) -> str: ...
 
@@ -84,6 +87,15 @@ class ToolRegistry:
     def names(self) -> List[str]:
         return list(self._tools)
 
+    def validate_durable(self, names: List[str]) -> None:
+        """Reject tools that cannot safely tolerate step-level replay."""
+        for name in names:
+            spec = self.get(name).spec
+            if spec.side_effects and not spec.idempotent:
+                raise ValueError(
+                    f"tool '{name}' has non-idempotent side effects and cannot run durably"
+                )
+
 
 # ───────── built-in deterministic tools ─────────
 
@@ -108,7 +120,7 @@ _ECHO = FunctionTool(
 # Whitelist of arithmetic operators. Deliberately *excludes* power (`ast.Pow` /
 # `**`): `9**9**9` is a one-line denial-of-service (a number with hundreds of
 # millions of digits), and arithmetic on an agent tool does not need it.
-_BINARY_OPS = {
+_BINARY_OPS: Dict[type[ast.operator], Callable[[float, float], float]] = {
     ast.Add: operator.add,
     ast.Sub: operator.sub,
     ast.Mult: operator.mul,
@@ -116,7 +128,7 @@ _BINARY_OPS = {
     ast.FloorDiv: operator.floordiv,
     ast.Mod: operator.mod,
 }
-_UNARY_OPS = {
+_UNARY_OPS: Dict[type[ast.unaryop], Callable[[float], float]] = {
     ast.UAdd: operator.pos,
     ast.USub: operator.neg,
 }
@@ -135,9 +147,7 @@ def _eval_arithmetic(node: ast.AST) -> float:
             raise ValueError(f"non-numeric literal: {node.value!r}")
         return node.value
     if isinstance(node, ast.BinOp) and type(node.op) in _BINARY_OPS:
-        return _BINARY_OPS[type(node.op)](
-            _eval_arithmetic(node.left), _eval_arithmetic(node.right)
-        )
+        return _BINARY_OPS[type(node.op)](_eval_arithmetic(node.left), _eval_arithmetic(node.right))
     if isinstance(node, ast.UnaryOp) and type(node.op) in _UNARY_OPS:
         return _UNARY_OPS[type(node.op)](_eval_arithmetic(node.operand))
     raise ValueError(f"unsupported expression element: {type(node).__name__}")

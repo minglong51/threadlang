@@ -21,6 +21,7 @@ registry, and a thin entrypoint. Two modes:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -39,22 +40,28 @@ def load_program():
     return parse_program(PROGRAM_PATH.read_text())
 
 
-def _make_client(backend: str, base_url: Optional[str]) -> LLMClient:
+def _make_client(
+    backend: str, base_url: Optional[str], max_tokens: int, timeout: float
+) -> LLMClient:
     if backend == "dry-run":
         return DryRunClient()
     if backend == "openai":
-        return OpenAICompatClient(base_url=base_url)
-    return AnthropicClient()
+        return OpenAICompatClient(base_url=base_url, max_tokens=max_tokens, timeout=timeout)
+    return AnthropicClient(max_tokens=max_tokens, timeout=timeout)
 
 
 def _add_backend_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
-        "--backend", choices=["dry-run", "openai", "anthropic"], default="dry-run",
+        "--backend",
+        choices=["dry-run", "openai", "anthropic"],
+        default="dry-run",
         help="LLM backend (default dry-run — deterministic, no key). "
-             "openai = DeepSeek/Ollama/any /v1; agent tool-calling needs a native "
-             "tool-calling model (DeepSeek or Claude).",
+        "openai = DeepSeek/Ollama/any /v1; agent tool-calling needs a native "
+        "tool-calling model (DeepSeek or Claude).",
     )
     p.add_argument("--base-url", default=None, help="endpoint for --backend openai")
+    p.add_argument("--max-tokens", type=int, default=1024)
+    p.add_argument("--timeout", type=float, default=120.0)
 
 
 def main(argv: Optional[list] = None) -> int:
@@ -66,6 +73,7 @@ def main(argv: Optional[list] = None) -> int:
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8765)
     p_serve.add_argument("--workers", type=int, default=2)
+    p_serve.add_argument("--auth-token-env", default="THREADLANG_AUTH_TOKEN")
     _add_backend_args(p_serve)
 
     p_run = sub.add_parser("run", help="triage one ticket durably, in-process")
@@ -75,25 +83,35 @@ def main(argv: Optional[list] = None) -> int:
     _add_backend_args(p_run)
 
     args = parser.parse_args(argv)
+    if args.max_tokens < 1 or args.timeout <= 0:
+        parser.error("--max-tokens and --timeout must be positive")
     registry = build_registry()
 
     try:
         if args.cmd == "serve":
-            client = _make_client(args.backend, args.base_url)
+            client = _make_client(args.backend, args.base_url, args.max_tokens, args.timeout)
             serve(
-                args.store, host=args.host, port=args.port,
-                n_workers=args.workers, llm_client=client, tools=registry,
+                args.store,
+                host=args.host,
+                port=args.port,
+                n_workers=args.workers,
+                llm_client=client,
+                tools=registry,
+                auth_token=os.environ.get(args.auth_token_env),
             )
             return 0
 
         # cmd == "run"
         backend = "dry-run" if args.dry_run else args.backend
-        client = _make_client(backend, args.base_url)
+        client = _make_client(backend, args.base_url, args.max_tokens, args.timeout)
         store = RunStore(args.store)
         try:
             durable = run_durable(
-                load_program(), {"ticket": args.ticket}, store,
-                llm_client=client, tools=registry,
+                load_program(),
+                {"ticket": args.ticket},
+                store,
+                llm_client=client,
+                tools=registry,
             )
         finally:
             store.close()
