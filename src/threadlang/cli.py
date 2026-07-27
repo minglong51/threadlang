@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 from typing import Dict, List
 
+from . import __version__
 from .ir import canonical_ir_bytes, compile_program, load_ir_bytes, program_from_ir
 from .llm import AnthropicClient, DryRunClient, LLMClient, LLMError, OpenAICompatClient
 from .metrics import compute_metrics
@@ -29,6 +30,7 @@ def _parse_inputs(input_flags: List[str]) -> Dict[str, str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run a ThreadLang source file.")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("source", type=Path, help="Path to a .thread source file or IR JSON")
     parser.add_argument(
         "--from-ir",

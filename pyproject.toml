@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "threadlang"
-version = "0.13.0"
+version = "0.13.1"
 description = "A compact DSL and single-node runtime for bounded, traceable LLM and agent workflows"
 readme = "README.md"
 requires-python = ">=3.11"
