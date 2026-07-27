@@ -7,7 +7,7 @@ workflows**. ThreadLang validates a workflow graph, executes model and tool
 calls within explicit limits, and records every binding, step, model turn, tool
 call, and result as a structured trace.
 
-The current source version is **v0.13.0 (alpha)**. It includes:
+The current source version is **v0.13.1 (alpha)**. It includes:
 
 - model and allow-listed [agentic tool-use steps](#agentic-steps-v03);
 - durable SQLite execution with [checkpoint, resume, and replay](#durability-v04);
