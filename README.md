@@ -2,36 +2,26 @@
 
 [![CI](https://github.com/minglong51/threadlang/actions/workflows/ci.yml/badge.svg)](https://github.com/minglong51/threadlang/actions/workflows/ci.yml)
 
-A small DSL for **deterministic, fully-traceable LLM and agent workflows** —
-the authoring layer of an agent platform whose bet is that every run should be
-a replayable, inspectable trace. Execution is **parse → AST → runtime → emit**,
-and every phase (context binding, step call, agent turn, tool call, tool
-result) appends a structured `TraceEvent`. The trace is the durable record of
-what happened.
+A compact DSL and single-node runtime for **bounded, traceable LLM and agent
+workflows**. ThreadLang validates a workflow graph, executes model and tool
+calls within explicit limits, and records every binding, step, model turn, tool
+call, and result as a structured trace.
 
-As of **v0.3** a step can be an `agent`: a model that runs a tool-use loop, not
-just a single prompt (see [Agentic steps](#agentic-steps-v03)). As of **v0.4** a
-run can be **durable**: its trace persists to sqlite as an event log, and a run
-that crashes [resumes from the last completed step](#durability-v04). As of
-**v0.5** there is a [**control plane**](#control-plane-v05): an HTTP API + worker
-pool that drains a durable run queue. As of **v0.6** the same server hosts a
-read-only [**observability dashboard**](#observability-v06) — a run list and a
-per-run trace timeline. As of **v0.7** there is a first product on the stack: a
-[**support-triage app**](#vertical-slice-support-triage-v07) that classifies a
-ticket, searches a knowledge base, and drafts a reply — durable, queued, and
-inspectable like any other run. As of **v0.8** every run has
-[**metrics**](#metrics-v08) — a deterministic-vs-observational view *derived
-from* the trace (`GET /metrics`), so monitoring and data-driven iteration read
-the same events the timeline does. As of **v0.9** programs are
-[**node graphs**](#routing-v09), not just pipelines: a `route` step makes an
-enum-contracted model decision and deterministic code dispatches the jump —
-forward-only, so checkpoints, resume, and replay survive branching unchanged.
-As of **v0.10** reliability is a [**measurement**](#probes-v010): `--probe N`
-runs a program N times and folds the stored runs into per-step variance,
-route-label distributions, and violation/failure rates. As of **v0.11** any
-`llm` step can carry an [**output contract**](#contracts-v011): an
-`expect { ... }` block the runtime enforces with a feedback retry.
-Build plans: [`docs/design/`](docs/design/).
+The current source version is **v0.13.0 (alpha)**. It includes:
+
+- model and allow-listed [agentic tool-use steps](#agentic-steps-v03);
+- durable SQLite execution with [checkpoint, resume, and replay](#durability-v04);
+- an authenticated [control plane](#control-plane-v05) and read-only
+  [trace dashboard](#observability-v06);
+- forward-only [routing](#routing-v09), enforceable [output contracts](#contracts-v011),
+  and repeat-run [reliability probes](#probes-v010);
+- canonical Workflow IR v1 with deterministic JSON, definition fingerprints,
+  strict untrusted-JSON loading, and compatibility execution through the
+  established AST runtime.
+
+The support boundary is deliberately narrow: one POSIX process, one local
+SQLite store, and at-least-once LLM calls across a hard crash. Design records
+and deliberate cuts live in [`docs/design/`](docs/design/).
 
 ```thread
 thread TwoStep {
@@ -60,10 +50,13 @@ thread TwoStep {
 
 ## Install
 
+ThreadLang is not published on PyPI yet. Install the current source:
+
 ```bash
-pip install threadlang                   # core only — includes the OpenAI-compatible
-                                         #   backend (DeepSeek / Ollama / vLLM …), zero deps
-pip install 'threadlang[anthropic]'      # + AnthropicClient (premium Claude calls)
+git clone https://github.com/minglong51/threadlang.git
+cd threadlang
+python -m pip install .                  # core + OpenAI-compatible backend, zero runtime deps
+python -m pip install '.[anthropic]'     # optional Anthropic client
 ```
 
 ## Run
@@ -504,8 +497,8 @@ behind the platform layers below rather than bolted on early.
 
 ## Roadmap — the platform layers
 
-ThreadLang is the authoring + execution core of a production agent platform.
-The remaining layers each keep the determinism/trace bet:
+ThreadLang is the authoring + execution core of a bounded, single-node agent
+platform. Each shipped layer keeps the determinism/trace bet:
 
 1. **Agentic core** *(v0.3, shipped)* — tools + agent tool-use loop.
 2. **Durability** *(v0.4, shipped)* — sqlite run store; the trace becomes an
@@ -532,7 +525,7 @@ The remaining layers each keep the determinism/trace bet:
    llm steps (one_of / matches / max_chars / nonempty), enforced with one
    feedback retry and failing loud; violations are trace events that metrics
    and probes fold.
-10. **Bounded production profile** *(v0.12)* — fail-closed resource policy,
+10. **Bounded production profile** *(v0.12, shipped)* — fail-closed resource policy,
     parser hardening, authenticated single-node control plane, source/input
     integrity binding, exclusive worker ownership, CAS resume, packaging,
     security gates, and a non-root container. The support boundary is one POSIX
@@ -540,6 +533,10 @@ The remaining layers each keep the determinism/trace bet:
     hard crash. See [`docs/production.md`](docs/production.md),
     [`SECURITY.md`](SECURITY.md), and the
     [semantic comparison](docs/benchmarks/dsl-comparison.md).
+11. **Canonical Workflow IR** *(v0.13, shipped)* — deterministic JSON and
+    definition fingerprints, strict untrusted-JSON loading, AST compatibility
+    execution, durable definition binding, and source-or-IR control-plane
+    submissions.
 
 ## License
 
