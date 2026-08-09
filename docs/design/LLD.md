@@ -475,7 +475,32 @@ output; on durable failure print `resume with: --store ... --resume <id>`
 
 ## Config / Env Surface
 
-Environment variables (all read in `llm.py`):
+### `policy.py` — fail-closed resource limits
+
+Module-level constants, no env override, imported by `ir.py`, `parser.py`,
+`runtime.py` and `server.py`. Its docstring is the scope statement worth keeping:
+these are **conservative defaults for the single-node runtime, not
+distributed-runtime service-level guarantees** — a workload that needs more should
+split programs or put an authenticated admission layer in front of the server,
+rather than raise the numbers.
+
+| Constant | Value | Bounds |
+|---|---|---|
+| `MAX_SOURCE_BYTES` | 256 KiB | `.thread` source accepted by the parser |
+| `MAX_IR_BYTES` | 1 MiB | serialized IR accepted by `load_ir_bytes` |
+| `MAX_STRING_CHARS` | 64 Ki | any single string value |
+| `MAX_AGENT_ITERS` | 32 | agent-step loop ceiling |
+| `MAX_REGEX_PATTERN_CHARS` / `MAX_REGEX_INPUT_CHARS` | 512 / 64 Ki | regex surface |
+| `REGEX_TIMEOUT_SECONDS` | 1.0 | per-match wall clock — the ReDoS floor |
+| `MAX_REQUEST_BYTES` | 1 MiB | HTTP body |
+| `MAX_INPUTS` / `MAX_INPUT_KEY_CHARS` / `MAX_INPUT_VALUE_CHARS` | 128 / 128 / 64 Ki | run inputs |
+| `DEFAULT_MAX_PENDING_RUNS` / `DEFAULT_MAX_RETAINED_RUNS` | 1 000 / 10 000 | queue + retention |
+| `DEFAULT_LIST_LIMIT` / `MAX_LIST_LIMIT` | 100 / 1 000 | list pagination |
+
+Fail-closed means a value over the limit is rejected, never truncated — a silently
+clipped program would execute something the author did not write.
+
+### Environment variables (all read in `llm.py`)
 
 - `ANTHROPIC_API_KEY` — `AnthropicClient` when no `api_key` passed
   (`llm.py:143`).
