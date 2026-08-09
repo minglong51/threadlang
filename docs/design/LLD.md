@@ -4,6 +4,12 @@ Refreshed for v0.12. The supported boundary is one POSIX process and one local
 SQLite store; see [`../production.md`](../production.md). Historical line
 references elsewhere in this document are explanatory and not API contracts.
 
+> **Refreshed 2026-08-09.** Adds `ir.py` (flagged by the drift check) and the five
+> `runs` columns the documented schema was missing — `program_sha256`,
+> `inputs_sha256`, `definition_json`, `definition_sha256`, `ir_version`. The
+> columns arrived by editing `store.py` in place, which the drift check cannot see;
+> only the new module flagged. Where this disagrees with the code, the code wins.
+
 ## Module Breakdown
 
 ### `ast.py` — AST node contract
@@ -291,6 +297,33 @@ the shared-client `WorkerPool` relies on (`control.py:66`).
   in-process `ARTICLES` list (`kb.py:25`). Swapping in a real store is a
   tool-implementation detail (`kb.py:6`).
 
+### `ir.py` — versioned canonical IR (724 lines)
+
+`IR_VERSION = "threadlang.ir/v1"`, `LANGUAGE_VERSION = "threadlang/v0.12"`
+(`ir.py:47-48`). IR v1 losslessly represents the v0.12 source AST for inspection,
+stable serialization, and definition fingerprints.
+
+**It is not a second interpreter.** The docstring is explicit: the existing runtime
+stays authoritative and execution goes through a strict IR→AST compatibility
+bridge; a native IR interpreter is deferred until its execution contract is
+separately reviewed and verified. Read that as a deliberate refusal, not a gap.
+
+- Frozen node types mirroring the AST: `IRContextEntry`, `IRTerm`, `IRExpression`,
+  `IRExpectation`, `IRRouteArm`, `IRLLMStep`, `IRAgentStep`, `IRRouteStep`,
+  `IREmit`, and the `WorkflowIR` root (`ir.py:56-138`).
+- `compile_program(program: Program) -> WorkflowIR` (`:207`) — AST → IR.
+- `program_from_ir(workflow: WorkflowIR) -> Program` (`:279`) — the bridge back;
+  this is what lets a stored definition execute on the existing runtime.
+- `load_ir_bytes(payload: bytes) -> WorkflowIR` (`:659`) — parse + validate;
+  raises `IRCompileError` (`:51`).
+- `canonical_ir_bytes(workflow) -> bytes` (`:712`) — UTF-8 JSON with `sort_keys` and
+  `(",", ":")` separators. The canonicalization is the point: identity must not
+  change because a dict happened to iterate differently.
+- `workflow_fingerprint(workflow) -> str` (`:722`) — SHA-256 of those bytes.
+
+Imported by `store.py`, `server.py`, `control.py`, `cli.py`, and re-exported from
+`__init__.py`, which makes it a load-bearing contract rather than a utility.
+
 ### `cli.py` — `threadlang` entry point
 
 - `main() -> int` (`cli.py:26`) — args: `source` (positional Path),
@@ -337,6 +370,9 @@ step names, `max_iters >= 1`, tool names must be identifiers.
 ```sql
 runs (id TEXT PK, program_name TEXT, status TEXT,   -- pending|running|completed|failed
       inputs_json TEXT, source TEXT,                -- source set when enqueued via the API
+      program_sha256 TEXT, inputs_sha256 TEXT,      -- reproducibility of what ran
+      definition_json TEXT,                         -- the canonical IR (ir.py)
+      definition_sha256 TEXT, ir_version TEXT,      -- workflow identity + IR schema
       output TEXT, error TEXT, created_at TEXT, updated_at TEXT)
 events (run_id TEXT, seq INTEGER, phase TEXT, message TEXT,
         data_json TEXT, ts TEXT,                    -- ts nullable for pre-v0.8 rows
