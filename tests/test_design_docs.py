@@ -59,9 +59,7 @@ def contract_files() -> list[Path]:
 
 def contract_path() -> Path:
     """The contract file carrying the map. Prefers AGENTS.md when both have it."""
-    candidates = [
-        p for p in contract_files() if FENCE.search(p.read_text(encoding="utf-8"))
-    ]
+    candidates = [p for p in contract_files() if FENCE.search(p.read_text(encoding="utf-8"))]
     if not candidates:
         raise ValueError(
             f"no ```design-doc-map fence in {[p.name for p in contract_files()]} at {REPO}"
@@ -160,9 +158,7 @@ def drift(doc: str, paths: list[str]) -> dict[str, object]:
         return {"doc": doc, "untracked": True, "added": [], "removed": [], "commits": 0}
 
     def modules(filt: str) -> list[str]:
-        out = git(
-            "diff", f"--diff-filter={filt}", "--name-only", f"{sha}..HEAD", "--", *paths
-        )
+        out = git("diff", f"--diff-filter={filt}", "--name-only", f"{sha}..HEAD", "--", *paths)
         return [p for p in out.splitlines() if p and not IS_TEST.search(p)]
 
     return {
