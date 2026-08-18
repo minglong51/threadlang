@@ -538,6 +538,12 @@ platform. Each shipped layer keeps the determinism/trace bet:
     execution, durable definition binding, and source-or-IR control-plane
     submissions.
 
+## Stay in the loop
+
+New tools and field notes on running AI agents with discipline go to the
+[Agent Discipline](https://buttondown.email/minglong51) list first — launch
+notes, operational patterns, early access. A few emails a month at most.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
