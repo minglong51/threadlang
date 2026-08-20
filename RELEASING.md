@@ -79,8 +79,9 @@ Inspect the draft release's generated notes and tag target:
 set -euo pipefail
 
 VERSION="$(python3.12 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+test "$(git rev-parse "v$VERSION^{commit}")" = "$(git rev-parse origin/main)"
 git show --no-patch --format=fuller "v$VERSION"
-gh release view "v$VERSION" --json isDraft,tagName,targetCommitish,name,body
+gh release view "v$VERSION" --json isDraft,tagName,name,body
 ```
 
 If the draft is correct, publish it explicitly:
