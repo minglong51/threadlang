@@ -17,6 +17,9 @@ context only.
 
 This file is shared verbatim across repos — it locates its own repo root, so it works
 at any depth. Do not fork it per repo.
+
+Canonical home: ~/dotfiles/design-doc-contract/test_design_docs.py — patch there, then
+propagate with ~/dotfiles/local-bin/design-doc-checker-sync.
 """
 
 import re
