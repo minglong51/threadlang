@@ -11,8 +11,8 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: python -m pip install --upgrade pip && python -m pip install '.[dev,anthropic]'
@@ -29,8 +29,8 @@ jobs:
     needs: verify
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: python -m pip install --upgrade pip build
@@ -41,7 +41,7 @@ jobs:
           [ "$GITHUB_REF_NAME" = "v$PKG" ] || { echo "tag $GITHUB_REF_NAME != v$PKG"; exit 1; }
           [ "$RUNTIME" = "$PKG" ] || { echo "runtime version $RUNTIME != pyproject version $PKG"; exit 1; }
       - run: python -m build
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/
@@ -50,10 +50,10 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist/
@@ -74,7 +74,7 @@ jobs:
     permissions:
       id-token: write  # trusted publishing (OIDC) — no API token stored anywhere
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist/
