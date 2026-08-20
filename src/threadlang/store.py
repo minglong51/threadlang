@@ -703,9 +703,9 @@ def run_durable(
             resume_outputs=resume_outputs,
             on_step_complete=_checkpoint,
         )
+        store.mark_completed(run_id, result.output)
     except Exception as exc:
         store.mark_failed(run_id, f"{type(exc).__name__}: {exc}")
         raise
 
-    store.mark_completed(run_id, result.output)
     return DurableRun(run_id=run_id, result=result)

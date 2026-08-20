@@ -10,11 +10,13 @@ from __future__ import annotations
 import hmac
 import ipaddress
 import json
+import math
 import os
+import sqlite3
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import SplitResult, parse_qs, urlsplit
 
 from .control import WorkerPool
 from .dashboard import render_run_detail, render_run_list
@@ -110,29 +112,46 @@ class _Handler(BaseHTTPRequestHandler):
         if self.server.auth_token is not None:  # type: ignore[attr-defined]
             return True
         host = self.headers.get("Host", "")
-        hostname = urlsplit(f"http://{host}").hostname
+        try:
+            hostname = urlsplit(f"http://{host}").hostname
+        except ValueError:
+            hostname = None
         if hostname is None or not _is_loopback_host(hostname):
             self._send(421, {"error": "invalid Host for loopback-only server"})
             return False
         if self.command == "POST":
             origin = self.headers.get("Origin")
             if origin:
-                origin_host = urlsplit(origin).hostname
+                try:
+                    origin_host = urlsplit(origin).hostname
+                except ValueError:
+                    origin_host = None
                 if origin_host is None or not _is_loopback_host(origin_host):
                     self._send(403, {"error": "cross-origin POST denied"})
                     return False
         return True
 
+    def _request_target(self) -> Optional[SplitResult]:
+        try:
+            return urlsplit(self.path)
+        except ValueError:
+            self._send(400, {"error": "invalid request target"})
+            return None
+
     def log_message(self, format: str, *args: object) -> None:
         # Structured logs intentionally exclude headers, bodies, inputs, traces,
         # and auth material.
+        try:
+            path = urlsplit(self.path).path
+        except ValueError:
+            path = "<invalid>"
         print(
             json.dumps(
                 {
                     "component": "threadlang-http",
                     "client": self.client_address[0],
                     "method": self.command,
-                    "path": urlsplit(self.path).path,
+                    "path": path,
                     "message": format % args,
                 },
                 separators=(",", ":"),
@@ -144,7 +163,9 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if not self._valid_browser_origin():
             return
-        parsed = urlsplit(self.path)
+        parsed = self._request_target()
+        if parsed is None:
+            return
         path = parsed.path
         if path == "/healthz":
             try:
@@ -159,11 +180,22 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/readyz":
             pool = self.server.worker_pool  # type: ignore[attr-defined]
             healthy = pool is not None and pool.is_healthy()
-            store = self._store()
             try:
-                queue = store.counts_by_status()
-            finally:
-                store.close()
+                store = self._store()
+                try:
+                    queue = store.counts_by_status()
+                finally:
+                    store.close()
+            except Exception:
+                self._send(
+                    503,
+                    {
+                        "ok": False,
+                        "database": "unavailable",
+                        "workers": pool.status() if pool is not None else None,
+                    },
+                )
+                return
             self._send(
                 200 if healthy else 503,
                 {
@@ -256,7 +288,10 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         if not self._valid_browser_origin():
             return
-        path = urlsplit(self.path).path
+        parsed = self._request_target()
+        if parsed is None:
+            return
+        path = parsed.path
         if path != "/runs":
             self._send(404, {"error": "not found"})
             return
@@ -284,7 +319,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
         try:
             body = json.loads(self.rfile.read(length) or b"{}")
-        except (json.JSONDecodeError, UnicodeDecodeError):
+        except (ValueError, UnicodeDecodeError, RecursionError):
             self._send(400, {"error": "body must be valid JSON"})
             return
         if not isinstance(body, dict):
@@ -317,6 +352,9 @@ class _Handler(BaseHTTPRequestHandler):
                 ).encode("utf-8")
                 workflow = load_ir_bytes(ir_bytes)
                 program = program_from_ir(workflow)
+        except UnicodeEncodeError:
+            self._send(400, {"error": "workflow text must be valid Unicode"})
+            return
         except (ParseError, IRCompileError) as exc:
             self._send(400, {"error": f"invalid workflow: {exc}"})
             return
@@ -366,6 +404,11 @@ def _validate_inputs(value: object) -> Optional[str]:
     for key, item in value.items():
         if not isinstance(key, str) or not isinstance(item, str):
             return "input keys and values must be strings"
+        try:
+            key.encode("utf-8")
+            item.encode("utf-8")
+        except UnicodeEncodeError:
+            return "input keys and values must be valid Unicode"
         if not key or len(key) > MAX_INPUT_KEY_CHARS:
             return f"input keys must be 1..{MAX_INPUT_KEY_CHARS} characters"
         if len(item) > MAX_INPUT_VALUE_CHARS:
@@ -401,12 +444,7 @@ def make_server(
     max_retained: int = DEFAULT_MAX_RETAINED_RUNS,
 ) -> ThreadingHTTPServer:
     """Build but do not start the control-plane server."""
-    if not _is_loopback_host(host) and not auth_token:
-        raise ValueError("non-loopback bind requires a bearer auth token")
-    if auth_token is not None and len(auth_token) < 16:
-        raise ValueError("auth token must be at least 16 characters")
-    if max_pending < 1 or max_retained < 0:
-        raise ValueError("max_pending must be >= 1 and max_retained must be >= 0")
+    _validate_server_options(host, port, auth_token, max_pending, max_retained)
     httpd = ThreadingHTTPServer((host, port), _Handler)
     httpd.store_path = store_path  # type: ignore[attr-defined]
     httpd.auth_token = auth_token  # type: ignore[attr-defined]
@@ -414,6 +452,23 @@ def make_server(
     httpd.max_pending = max_pending  # type: ignore[attr-defined]
     httpd.max_retained = max_retained  # type: ignore[attr-defined]
     return httpd
+
+
+def _validate_server_options(
+    host: str,
+    port: int,
+    auth_token: Optional[str],
+    max_pending: int,
+    max_retained: int,
+) -> None:
+    if not _is_loopback_host(host) and not auth_token:
+        raise ValueError("non-loopback bind requires a bearer auth token")
+    if auth_token is not None and len(auth_token) < 16:
+        raise ValueError("auth token must be at least 16 characters")
+    if not 0 <= port <= 65535:
+        raise ValueError("port must be between 0 and 65535")
+    if max_pending < 1 or max_retained < 0:
+        raise ValueError("max_pending must be >= 1 and max_retained must be >= 0")
 
 
 def serve(
@@ -428,6 +483,9 @@ def serve(
     max_pending: int = DEFAULT_MAX_PENDING_RUNS,
     max_retained: int = DEFAULT_MAX_RETAINED_RUNS,
 ) -> None:
+    _validate_server_options(host, port, auth_token, max_pending, max_retained)
+    if n_workers < 1:
+        raise ValueError("n_workers must be >= 1")
     pool = WorkerPool(store_path, n_workers=n_workers, llm_client=llm_client, tools=tools)
     pool.start()
     try:
@@ -481,26 +539,40 @@ def main() -> int:
     parser.add_argument("--max-retained", type=int, default=DEFAULT_MAX_RETAINED_RUNS)
     args = parser.parse_args()
 
-    client: LLMClient
-    if args.backend == "dry-run":
-        client = DryRunClient()
-    elif args.backend == "openai":
-        client = OpenAICompatClient(
-            base_url=args.base_url,
-            max_tokens=args.max_tokens,
-            timeout=args.timeout,
-        )
-    else:
-        try:
-            client = AnthropicClient(max_tokens=args.max_tokens, timeout=args.timeout)
-        except LLMError as exc:
-            print(f"error: {exc}", file=sys.stderr, flush=True)
-            return 1
-
-    if args.max_tokens < 1 or args.timeout <= 0:
+    if args.max_tokens < 1 or not math.isfinite(args.timeout) or args.timeout <= 0:
         print("error: --max-tokens and --timeout must be positive", file=sys.stderr)
         return 2
     auth_token = os.environ.get(args.auth_token_env)
+    try:
+        _validate_server_options(
+            args.host,
+            args.port,
+            auth_token,
+            args.max_pending,
+            args.max_retained,
+        )
+        if args.workers < 1:
+            raise ValueError("workers must be >= 1")
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr, flush=True)
+        return 2
+
+    try:
+        client: LLMClient
+        if args.backend == "dry-run":
+            client = DryRunClient()
+        elif args.backend == "openai":
+            client = OpenAICompatClient(
+                base_url=args.base_url,
+                max_tokens=args.max_tokens,
+                timeout=args.timeout,
+            )
+        else:
+            client = AnthropicClient(max_tokens=args.max_tokens, timeout=args.timeout)
+    except LLMError as exc:
+        print(f"error: {exc}", file=sys.stderr, flush=True)
+        return 1
+
     try:
         serve(
             args.store,
@@ -512,7 +584,7 @@ def main() -> int:
             max_pending=args.max_pending,
             max_retained=args.max_retained,
         )
-    except ValueError as exc:
+    except (OSError, RuntimeError, sqlite3.Error, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr, flush=True)
         return 2
     return 0

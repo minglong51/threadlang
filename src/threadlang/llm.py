@@ -15,6 +15,8 @@ implement both protocols.
 
 from __future__ import annotations
 
+import http.client
+import ipaddress
 import json
 import os
 import urllib.error
@@ -23,6 +25,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Dict, List, Mapping, Protocol, Sequence
 
+from .policy import MAX_PROVIDER_RESPONSE_BYTES
 from .tools import ToolSpec
 
 
@@ -83,6 +86,36 @@ class RouteLLMClient(Protocol):
 
 class LLMError(RuntimeError):
     """Raised when an LLM call fails."""
+
+
+def _validated_provider_text(text: str) -> str:
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise LLMError("provider returned invalid Unicode text") from exc
+    return text
+
+
+def _is_loopback_hostname(hostname: str) -> bool:
+    if hostname.casefold() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: object,
+        code: int,
+        msg: str,
+        headers: Mapping[str, str],
+        newurl: str,
+    ) -> None:
+        return None
 
 
 def _placeholder_args(schema: Mapping[str, object]) -> Dict[str, object]:
@@ -176,7 +209,7 @@ class AnthropicClient:
             if getattr(block, "type", None) == "text":
                 text = block.text  # type: ignore[attr-defined]
                 if text:
-                    return text
+                    return _validated_provider_text(text)
         raise LLMError("provider returned no text content")
 
     def agent_step(
@@ -200,7 +233,7 @@ class AnthropicClient:
         for block in resp.content:
             btype = getattr(block, "type", None)
             if btype == "text":
-                text_parts.append(block.text)  # type: ignore[attr-defined]
+                text_parts.append(_validated_provider_text(block.text))  # type: ignore[attr-defined]
             elif btype == "tool_use":
                 calls.append(
                     ToolCall(
@@ -280,44 +313,69 @@ class OpenAICompatClient:
         self._base_url = (
             base_url or os.environ.get("THREADLANG_BASE_URL") or DEEPSEEK_BASE_URL
         ).rstrip("/")
-        parsed_base = urllib.parse.urlsplit(self._base_url)
-        if parsed_base.scheme not in ("http", "https") or not parsed_base.hostname:
+        try:
+            parsed_base = urllib.parse.urlsplit(self._base_url)
+            hostname = parsed_base.hostname
+            parsed_base.port
+        except ValueError as exc:
+            raise LLMError(
+                "OpenAI-compatible base URL must use http or https and include a host"
+            ) from exc
+        if parsed_base.scheme not in ("http", "https") or not hostname:
             raise LLMError("OpenAI-compatible base URL must use http or https and include a host")
+        if any(ord(char) <= 32 or ord(char) == 127 for char in hostname):
+            raise LLMError("OpenAI-compatible base URL must include a valid host")
+        if parsed_base.username is not None or parsed_base.password is not None:
+            raise LLMError("OpenAI-compatible base URL must not include credentials")
+        if parsed_base.query or parsed_base.fragment:
+            raise LLMError("OpenAI-compatible base URL must not include a query or fragment")
         # A key is optional: local servers (Ollama) ignore it. Hosted providers
         # 401 without one, which surfaces as a clear LLMError at call time.
-        self._api_key = (
-            api_key or os.environ.get("THREADLANG_API_KEY") or os.environ.get("OPENAI_API_KEY")
-        )
+        resolved_key = api_key or os.environ.get("THREADLANG_API_KEY")
+        if not resolved_key and parsed_base.scheme == "https" and hostname == "api.openai.com":
+            resolved_key = os.environ.get("OPENAI_API_KEY")
+        if resolved_key and parsed_base.scheme != "https" and not _is_loopback_hostname(hostname):
+            raise LLMError("refusing to send an API key to a non-HTTPS, non-loopback endpoint")
+        self._api_key = resolved_key
+        bypass_proxy = parsed_base.scheme == "http" and _is_loopback_hostname(hostname)
+        handlers: List[urllib.request.BaseHandler] = [_NoRedirectHandler()]
+        if bypass_proxy:
+            handlers.insert(0, urllib.request.ProxyHandler({}))
+        self._opener = urllib.request.build_opener(*handlers)
         self._max_tokens = max_tokens
         self._timeout = timeout
 
     def _post(self, payload: Dict[str, object]) -> Dict[str, object]:
         data = json.dumps(payload).encode("utf-8")
         headers = {"Content-Type": "application/json"}
-        if self._api_key:
-            headers["Authorization"] = f"Bearer {self._api_key}"
-        request = urllib.request.Request(
-            f"{self._base_url}/chat/completions", data=data, headers=headers, method="POST"
-        )
         try:
-            # URL scheme and host are validated in __init__; urllib is used to
-            # keep the OpenAI-compatible adapter dependency-free.
-            with urllib.request.urlopen(  # nosec B310
-                request, timeout=self._timeout
-            ) as resp:
-                body = resp.read().decode("utf-8")
+            request = urllib.request.Request(
+                f"{self._base_url}/chat/completions", data=data, headers=headers, method="POST"
+            )
+            if self._api_key:
+                request.add_unredirected_header("Authorization", f"Bearer {self._api_key}")
+            response = self._opener.open(request, timeout=self._timeout)  # nosec B310
+            with response as resp:
+                body_bytes = resp.read(MAX_PROVIDER_RESPONSE_BYTES + 1)
+                if len(body_bytes) > MAX_PROVIDER_RESPONSE_BYTES:
+                    raise LLMError(
+                        f"provider response exceeds {MAX_PROVIDER_RESPONSE_BYTES} byte limit"
+                    )
+                body = body_bytes.decode("utf-8")
         except urllib.error.HTTPError as exc:
             # Provider bodies may contain request fragments, account metadata,
             # or echoed secrets. Persist only the status and endpoint; operators
             # can correlate provider-side logs without leaking the body into the
             # durable run record or dashboard.
-            raise LLMError(f"HTTP {exc.code} from {self._base_url}") from exc
+            raise LLMError(f"HTTP {exc.code} from provider endpoint") from exc
         except urllib.error.URLError as exc:
-            raise LLMError(f"could not reach {self._base_url}: {exc.reason}") from exc
+            raise LLMError(f"could not reach provider endpoint: {exc.reason}") from exc
+        except (http.client.HTTPException, UnicodeError, ValueError) as exc:
+            raise LLMError("invalid OpenAI-compatible provider endpoint") from exc
         try:
             return json.loads(body)
         except json.JSONDecodeError as exc:
-            raise LLMError(f"non-JSON response from {self._base_url}") from exc
+            raise LLMError("non-JSON response from provider endpoint") from exc
 
     def complete(self, model: str, prompt: str) -> str:
         resp = self._post(
@@ -333,7 +391,7 @@ class OpenAICompatClient:
         content = _openai_message(resp).get("content")
         if not isinstance(content, str) or not content:
             raise LLMError("provider returned no text content")
-        return content
+        return _validated_provider_text(content)
 
     def agent_step(
         self, model: str, messages: Sequence[Message], tools: Sequence[ToolSpec]
@@ -360,23 +418,51 @@ class OpenAICompatClient:
         if choice.get("finish_reason") == "length":
             raise LLMError("provider response was truncated at max_tokens")
         message = _openai_message(response)
-        text = message.get("content") or ""
+        raw_text = message.get("content")
+        if raw_text is not None and not isinstance(raw_text, str):
+            raise LLMError("provider returned invalid text content")
+        text = _validated_provider_text(raw_text) if raw_text else ""
         calls: List[ToolCall] = []
-        for raw in message.get("tool_calls") or ():
-            fn = raw.get("function", {}) if isinstance(raw, Mapping) else {}
-            raw_args = fn.get("arguments", "{}")
+        raw_calls = message.get("tool_calls")
+        if raw_calls is None:
+            raw_calls = []
+        elif not isinstance(raw_calls, list):
+            raise LLMError("provider returned malformed tool calls")
+        for raw in raw_calls:
+            if not isinstance(raw, Mapping):
+                raise LLMError("provider returned malformed tool call")
+            fn = raw.get("function")
+            if not isinstance(fn, Mapping):
+                raise LLMError("provider returned malformed tool call")
+            call_name = fn.get("name")
+            if not isinstance(call_name, str) or not call_name:
+                raise LLMError("provider returned tool call without a valid name")
+            call_id = raw.get("id")
+            if call_id is None:
+                call_id = f"call_{len(calls)}"
+            if not isinstance(call_id, str) or not call_id:
+                raise LLMError("provider returned tool call without a valid id")
+            raw_args = fn.get("arguments")
             try:
-                arguments = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args)
-            except (json.JSONDecodeError, TypeError):
-                arguments = {}
+                if isinstance(raw_args, str):
+                    arguments = json.loads(raw_args)
+                elif isinstance(raw_args, Mapping):
+                    arguments = dict(raw_args)
+                else:
+                    raise TypeError
+                if not isinstance(arguments, dict):
+                    raise TypeError
+                json.dumps(arguments, ensure_ascii=False, allow_nan=False).encode("utf-8")
+            except (json.JSONDecodeError, TypeError, ValueError, UnicodeEncodeError) as exc:
+                raise LLMError("provider returned malformed tool-call arguments") from exc
             calls.append(
                 ToolCall(
-                    id=str(raw.get("id") or f"call_{len(calls)}"),
-                    name=str(fn.get("name", "")),
-                    arguments=arguments if isinstance(arguments, dict) else {},
+                    id=_validated_provider_text(call_id),
+                    name=_validated_provider_text(call_name),
+                    arguments=arguments,
                 )
             )
-        turn = AgentTurn(text=str(text), tool_calls=tuple(calls))
+        turn = AgentTurn(text=text, tool_calls=tuple(calls))
         if not turn.text and not turn.tool_calls:
             raise LLMError("provider returned neither text nor tool calls")
         return turn
@@ -434,7 +520,5 @@ def _to_openai_messages(messages: Sequence[Message]) -> List[Dict[str, object]]:
 
 
 def default_client() -> LLMClient:
-    """Used by CLI when --dry-run is not passed. Raises if the SDK or key
-    are missing — call sites should catch and fall back to DryRunClient
-    if they want a soft mode."""
+    """Return the default Anthropic client, failing closed when unavailable."""
     return AnthropicClient()

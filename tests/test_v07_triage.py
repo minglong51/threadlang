@@ -18,10 +18,12 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from threadlang.apps.support_triage.app import load_program  # noqa: E402
+from threadlang.apps.support_triage.app import load_program, main as app_main  # noqa: E402
 from threadlang.apps.support_triage.tools import build_registry  # noqa: E402
 from threadlang.ast import AgentStep, Step  # noqa: E402
 from threadlang.control import WorkerPool  # noqa: E402
@@ -106,3 +108,60 @@ def test_durable_queued_path(tmp_path) -> None:
         )
     finally:
         store.close()
+
+
+def test_run_formats_store_open_errors(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    store_path = tmp_path / "missing" / "runs.db"
+    assert app_main(["run", "--ticket", "test", "--store", str(store_path), "--dry-run"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("error:")
+    assert "Traceback" not in captured.err
+
+
+@pytest.mark.parametrize("timeout", ["nan", "inf", "-inf"])
+def test_rejects_non_finite_timeout(timeout: str, tmp_path: Path) -> None:
+    with pytest.raises(SystemExit) as raised:
+        app_main(
+            [
+                "run",
+                "--ticket",
+                "x",
+                "--store",
+                str(tmp_path / "runs.db"),
+                "--dry-run",
+                f"--timeout={timeout}",
+            ]
+        )
+    assert raised.value.code == 2
+
+
+def test_serve_validates_bounds_before_provider_setup(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls = 0
+
+    def unexpected_provider(*args: object, **kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
+
+    monkeypatch.setattr("threadlang.apps.support_triage.app._make_client", unexpected_provider)
+    with pytest.raises(SystemExit) as raised:
+        app_main(
+            [
+                "serve",
+                "--store",
+                "x.db",
+                "--workers",
+                "0",
+                "--backend",
+                "openai",
+                "--base-url",
+                "not-a-url",
+            ]
+        )
+    assert raised.value.code == 2
+    assert calls == 0
+    captured = capsys.readouterr()
+    assert "workers must be >= 1" in captured.err
+    assert "base URL" not in captured.err

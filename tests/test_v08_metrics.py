@@ -116,6 +116,16 @@ def test_agent_step_metrics() -> None:
     assert m.steps_completed == 1
 
 
+def test_release_report_dry_run_has_no_tool_errors() -> None:
+    source = (REPO_ROOT / "examples" / "release_report.thread").read_text(encoding="utf-8")
+    result = run_program(
+        parse_program(source),
+        inputs={"stats": "errors fell from 40 to 10", "notes": "shipped"},
+        llm_client=DryRunClient(),
+    )
+    assert compute_metrics(result.trace).tool_errors == 0
+
+
 def test_tool_errors_are_counted() -> None:
     trace = [
         TraceEvent("agent", "Agent step 's' started", {"step": "s"}),

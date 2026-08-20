@@ -76,6 +76,24 @@ def test_durable_run_persists_events_status_and_checkpoints(tmp_path: Path) -> N
     store.close()
 
 
+def test_completion_persistence_failure_marks_run_failed(tmp_path: Path) -> None:
+    class InvalidUnicodeClient:
+        def complete(self, model: str, prompt: str) -> str:
+            return "\ud800"
+
+    source = 'thread T { context {} steps { step x { llm "m" { "prompt" } } } emit text { steps.x.output } }'
+    store = RunStore(str(tmp_path / "runs.db"))
+
+    with pytest.raises(UnicodeEncodeError):
+        run_durable(parse_program(source), {}, store, llm_client=InvalidUnicodeClient())
+
+    runs = store.list_runs()
+    assert len(runs) == 1
+    assert runs[0].status == "failed"
+    assert runs[0].error is not None and "UnicodeEncodeError" in runs[0].error
+    store.close()
+
+
 def test_resume_skips_completed_step_after_crash(tmp_path: Path) -> None:
     store = RunStore(str(tmp_path / "runs.db"))
     program = parse_program(_TWO_STEP)
