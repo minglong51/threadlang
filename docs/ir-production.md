@@ -83,7 +83,8 @@ Resume fails closed when:
 - stored canonical definition cannot be parsed and validated;
 - stored bytes do not match the persisted digest;
 - the supplied workflow definition differs from the original run;
-- source or inputs violate the existing v0.12 resume fence.
+- canonical inputs differ, or a legacy row without definition identity fails
+  its source/program fence.
 
 Older databases migrate additively. Existing rows keep nullable definition fields and are bound only when the current program identity can be proved under the v0.12 migration rules.
 

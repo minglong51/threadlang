@@ -7,7 +7,7 @@ thread ReleaseReport {
   steps {
     step compute {
       agent "deepseek-chat" {
-        tools [ calculator, echo ]
+        tools [ echo, calculator ]
         max_iters 4
         "Work out the percentage change implied by these release stats. Use the calculator tool for any arithmetic; do not estimate. Report each figure on its own line. Stats:\n" + inputs.stats
       }

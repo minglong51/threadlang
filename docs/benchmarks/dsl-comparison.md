@@ -2,7 +2,7 @@
 
 This is a primary-source **semantics matrix**, not a model-quality or performance score. `Full`, `Partial`, and `No` describe documented behavior; they are not weighted or aggregated.
 
-| Capability | ThreadLang v0.12 | Temporal | AWS Step Functions / ASL | LangGraph | AutoGen GraphFlow | Dapr Workflow |
+| Capability | ThreadLang v0.13 | Temporal | AWS Step Functions / ASL | LangGraph | AutoGen GraphFlow | Dapr Workflow |
 |---|---|---|---|---|---|---|
 | Deterministic control structure | Full: parsed forward-only graph | Full: replay-compatible workflow commands | Full: declarative state-machine interpreter | Partial: graph/super-step control, not Temporal replay | Partial: deterministic routing structure; experimental | Full: replay-compatible workflow code |
 | Crash durability | Partial: SQLite step-boundary checkpoint | Full event-history reconstruction | Full for Standard Workflows | Full with persistent checkpointer | Application-managed save/load | Full event-sourced state via Dapr |
@@ -17,7 +17,7 @@ This is a primary-source **semantics matrix**, not a model-quality or performanc
 
 ## Design conclusions
 
-1. ThreadLang should describe v0.12 as **step-checkpoint durability**, not durable replay.
+1. ThreadLang should describe v0.13 as **step-checkpoint durability**, not durable replay.
 2. LLM and agent calls are nondeterministic activities and may execute more than once after a hard crash.
 3. The current product boundary is intentionally smaller than Temporal, ASL, LangGraph, or Dapr: a compact textual agent DSL with local execution and inspection.
 4. Durable external events, version pinning/migrations, typed state, and call-level idempotency keys belong in later versioned designs, not undocumented semantics.

@@ -21,14 +21,17 @@ registry, and a thin entrypoint. Two modes:
 from __future__ import annotations
 
 import argparse
+import math
 import os
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Optional
 
 from ...llm import AnthropicClient, DryRunClient, LLMClient, LLMError, OpenAICompatClient
 from ...parser import parse_program
-from ...server import serve
+from ...policy import DEFAULT_MAX_PENDING_RUNS, DEFAULT_MAX_RETAINED_RUNS
+from ...server import _validate_server_options, serve
 from ...store import RunStore, run_durable
 from .tools import build_registry
 
@@ -83,8 +86,23 @@ def main(argv: Optional[list] = None) -> int:
     _add_backend_args(p_run)
 
     args = parser.parse_args(argv)
-    if args.max_tokens < 1 or args.timeout <= 0:
+    if args.max_tokens < 1 or not math.isfinite(args.timeout) or args.timeout <= 0:
         parser.error("--max-tokens and --timeout must be positive")
+    auth_token = None
+    if args.cmd == "serve":
+        auth_token = os.environ.get(args.auth_token_env)
+        try:
+            _validate_server_options(
+                args.host,
+                args.port,
+                auth_token,
+                DEFAULT_MAX_PENDING_RUNS,
+                DEFAULT_MAX_RETAINED_RUNS,
+            )
+            if args.workers < 1:
+                raise ValueError("workers must be >= 1")
+        except ValueError as exc:
+            parser.error(str(exc))
     registry = build_registry()
 
     try:
@@ -97,7 +115,7 @@ def main(argv: Optional[list] = None) -> int:
                 n_workers=args.workers,
                 llm_client=client,
                 tools=registry,
-                auth_token=os.environ.get(args.auth_token_env),
+                auth_token=auth_token,
             )
             return 0
 
@@ -123,7 +141,7 @@ def main(argv: Optional[list] = None) -> int:
         print(f"run_id: {durable.run_id}  status: {final.status if final else '?'}\n")
         print(durable.result.output)
         return 0 if final and final.status == "completed" else 1
-    except (LLMError, FileNotFoundError) as exc:
+    except (LLMError, OSError, RuntimeError, sqlite3.Error, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
