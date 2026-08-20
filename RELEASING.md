@@ -22,7 +22,8 @@ test -z "$(git status --short)"
 
 RELEASE_ENV="$(mktemp -d)/venv"
 python3.12 -m venv "$RELEASE_ENV"
-"$RELEASE_ENV/bin/pip" install '.[dev,anthropic]'
+"$RELEASE_ENV/bin/python" -m pip install --upgrade pip
+"$RELEASE_ENV/bin/python" -m pip install '.[dev,anthropic]'
 "$RELEASE_ENV/bin/python" -m pytest -q
 "$RELEASE_ENV/bin/ruff" check .
 "$RELEASE_ENV/bin/ruff" format --check .
