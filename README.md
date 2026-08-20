@@ -184,11 +184,14 @@ threadlang examples/two_step.thread --store runs.db --resume <id> \
 from threadlang import parse_program, run_durable, RunStore
 
 store = RunStore("runs.db")
-durable = run_durable(parse_program(src), {"text": "..."}, store)
-durable.run_id              # the run's id
-store.get_run(durable.run_id).status        # 'completed' | 'failed' | 'running'
-store.load_events(durable.run_id)           # the persisted trace
-store.list_runs()                           # all runs (for a dashboard)
+try:
+    durable = run_durable(parse_program(src), {"text": "..."}, store)
+    durable.run_id                          # the run's id
+    store.get_run(durable.run_id).status    # 'completed' | 'failed' | 'running'
+    store.load_events(durable.run_id)       # the persisted trace
+    store.list_runs()                       # all runs (for a dashboard)
+finally:
+    store.close()
 ```
 
 The runtime stays storage-agnostic — `run_durable` hands it a write-through

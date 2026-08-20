@@ -12,20 +12,19 @@ every phase.
 - Explicit, inspectable AST nodes (frozen dataclasses).
 - Runtime traceability — every step appends a `TraceEvent`.
 - No hidden magic; clarity over cleverness.
-- Zero runtime dependencies for `emit text` programs; one optional dep
-  (`anthropic`) for programs that call a real model.
+- Zero required runtime dependencies. The OpenAI-compatible backend uses
+  stdlib HTTP; the `anthropic` extra is required only for `AnthropicClient`.
 
 ## Non-goals in v1
 
-- Loops.
-- Recursion.
-- Branching / conditionals. *(Since v0.9: forward-only routing — see below.
-  Cyclic control flow remains out.)*
+- Cyclic control flow, loops, and recursion.
+- Parallel step scheduling.
 - Streaming output.
-- Tool use / function calling. *(Since v0.3: `agent` steps run a tool-use
-  loop over an allow-listed registry.)*
-- System prompts (LLM calls send a single user-role message).
-- Advanced type system (terms are strings, period).
+- External events, human approval, cancellation, and in-flight migration.
+- Distributed execution.
+- Source-level system prompts (plain llm/emit calls send one user-role prompt;
+  agent message history is runtime-owned).
+- An advanced type system (expression values are strings).
 
 These are deliberate. The point of v1 is that the workflow shape (context
 → steps → emit) actually executes; the surface area is held narrow on
@@ -35,36 +34,41 @@ extension.
 ## Supported syntax
 
 ```
-program     = "thread" name "{" context [ steps ] emit "}"
+program     = "thread" name "{" context [ steps ] emit_block "}"
 context     = "context" "{" { name "=" string } "}"
 steps       = "steps" "{" { step } "}"
 step        = "step" name "{" ( llm_body | agent_body | route_body ) "}"
 llm_body    = "llm" string "{" expression [ expect ] [ then ] "}"
 agent_body  = "agent" string "{" [ tools ] [ max_iters ] expression [ then ] "}"
+tools       = "tools" "[" [ name { "," name } ] "]"
+max_iters   = "max_iters" integer
 expect      = "expect" "{" rule { rule } "}"
 rule        = "one_of" string { "," string } | "matches" string
-            | "max_chars" number | "nonempty"
+            | "max_chars" integer | "nonempty"
 route_body  = "route" string "{" expression arm { arm } [ "else" "->" target ] "}"
 arm         = "on" string "->" target
 then        = "then" "->" target
 target      = name | "end"
+emit_block  = emit_text | emit_llm
 emit_text   = "emit" "text" "{" expression "}"
 emit_llm    = "emit" "llm" string "{" expression "}"
 expression  = term { "+" term }
 term        = string | "context." name | "inputs." name
             | "steps." name ".output" [ "?" ]
+integer     = digit { digit }
 ```
 
 - `context` block: name → string-literal map. Required.
-- `steps` block: zero or more `step` definitions. Optional. Each step
-  calls an LLM and binds the response to `steps.<step_name>.output`.
+- `steps` block: zero or more forward-only `llm`, `agent`, or `route` step
+  definitions. Optional. Each executed step binds its output to
+  `steps.<step_name>.output`; route edges can skip later steps.
 - `emit` block: required. Either `emit text` (string concatenation over
   expression terms) or `emit llm "<model>" { ... }` (rendered prompt sent
   to the model; response becomes the program output).
 - Step names within a single `steps` block must be unique. `end` is a
   reserved jump target and cannot be a step name.
-- Source, string, step-count, expression, contract, and `max_iters` limits are
-  normative fail-closed runtime policy. Programs exceeding them are invalid.
+- Source bytes, string literals, regex patterns, and `max_iters` are bounded by
+  normative fail-closed policy; values over those limits are rejected.
 - Comments and delimiters inside quoted strings are lexical content, not
   structure. The parser consumes all input and reports line/column errors.
 
@@ -75,10 +79,10 @@ provides step-boundary checkpoints on one POSIX process and one local SQLite
 store. It binds a v0.13 run to its canonical Workflow IR and canonical inputs;
 the source digest is retained as metadata and as the legacy resume fence for
 rows without IR identity. Concurrent resume is rejected with a compare-and-swap
-transition. A hard crash may repeat the current incomplete LLM/agent step; this
-is not deterministic event-history replay. Side-effecting tools must be
-declared idempotent to run durably. The full operational contract is
-[`production.md`](production.md).
+transition. A hard crash may repeat the current incomplete `llm`, `agent`, or
+`route` step, or an incomplete `emit llm`; this is not deterministic
+event-history replay. Side-effecting tools must be declared idempotent to run
+durably. The full operational contract is [`production.md`](production.md).
 
 ### Step graph (v0.9)
 
@@ -140,50 +144,106 @@ final answer is shaped by its tool loop.
 
 ## Runtime behavior
 
-1. Build context (deterministic map).
-2. For each step in declaration order:
-   a. Render its prompt expression against (context, inputs, prior step outputs).
-   b. Call `client.complete(model, prompt)` on the provided `LLMClient`.
-   c. Bind the response to `steps.<name>.output`.
-3. Evaluate the emit block:
+1. Execute source through `run_program`, or strictly load Workflow IR v1 and
+   bridge it through `program_from_ir`/`run_ir` to the same authoritative AST
+   interpreter.
+2. Build the deterministic context map.
+3. Traverse the forward-only step graph from the first declared step:
+   - `llm` renders its prompt and calls `complete` (or optional `route` for a
+     `one_of` contract). Contracts are validated, retried once with feedback,
+     and then fail closed.
+   - `agent` calls `agent_step` in a bounded loop, executes only allow-listed
+     tools, feeds observations back to the client, and binds the tool-free
+     final answer.
+   - `route` calls optional `route` or falls back to `complete`, normalizes the
+     closed-label result, retries one rejection, takes the matching forward
+     edge, uses `else` after a second miss, or fails if no `else` is declared.
+   - After step completion and outgoing-edge resolution, bind the output and
+     invoke the optional checkpoint callback. Resumed outputs skip their
+     model/tool work.
+4. Evaluate the emit block:
    - `emit text` — concatenate expression terms.
    - `emit llm`  — render prompt expression, call model, return response.
-4. Return `RuntimeResult(output, trace, step_outputs)`.
+5. Append the final emit event and return
+   `RuntimeResult(output, trace, step_outputs)`.
 
-Trace events are appended at each context binding, each step (one for
-"calling", one for "produced output"), each rendered expression term in
-`emit text`, and on the final emit.
+Trace phases cover context construction, llm and agent turns, tool calls and
+denials, routing, contract rejection, `emit text` term evaluation, checkpoint
+reuse, and final emission. A resumed route re-derives its edge from the stored
+output without another model call.
 
 ## LLM client protocol
 
 ```python
 class LLMClient(Protocol):
     def complete(self, model: str, prompt: str) -> str: ...
+
+class AgentLLMClient(Protocol):
+    def agent_step(
+        self,
+        model: str,
+        messages: Sequence[Message],
+        tools: Sequence[ToolSpec],
+    ) -> AgentTurn: ...
+
+class RouteLLMClient(Protocol):
+    def route(
+        self,
+        model: str,
+        prompt: str,
+        options: Sequence[str],
+    ) -> str: ...
 ```
+
+`complete` is the baseline protocol for `llm`, `emit llm`, and the fallback
+route path. `agent_step` is required only by `agent` steps. `route` is optional;
+when absent, the runtime sends the same closed-label contract through
+`complete`.
 
 Built-in implementations:
 
-- `DryRunClient` — returns `f"[dry-run:{model}] {prompt}"`. Used by tests
-  and by `threadlang --dry-run`.
-- `AnthropicClient` — real Claude calls via the `anthropic` SDK. Requires
-  the optional install (`pip install 'threadlang[anthropic]'`) and
-  `ANTHROPIC_API_KEY` in env.
+- `DryRunClient` — deterministic `complete`, first-option routing, and a
+  two-phase agent stub. Used by tests and explicit `threadlang --dry-run`.
+- `AnthropicClient` — Claude `complete` and native tool use via the optional
+  `anthropic` SDK. Requires `pip install 'threadlang[anthropic]'` and
+  `ANTHROPIC_API_KEY`.
+- `OpenAICompatClient` — dependency-free stdlib HTTP client implementing
+  `complete` and `agent_step` through OpenAI `tools`/`tool_calls`. It defaults
+  to DeepSeek and can target OpenAI, Ollama, vLLM, or another compatible `/v1`
+  endpoint.
 
-Any object satisfying the `complete(model, prompt) -> str` protocol works;
-plug in OpenAI, Ollama, etc., as needed.
+Any object satisfying only `complete(model, prompt) -> str` can run llm/emit
+work and routes through the fallback. Agent programs require `agent_step`.
 
 ## CLI
 
 ```
-threadlang <source.thread> [--input k=v ...] [--dry-run] [--trace]
+threadlang [--version] [--from-ir] [--emit-ir PATH]
+           [--input k=v ...]
+           [--backend {dry-run,anthropic,openai}] [--dry-run]
+           [--base-url URL] [--max-tokens N] [--timeout SECONDS]
+           [--store PATH] [--resume RUN_ID] [--probe N]
+           [--trace] [--metrics]
+           <SOURCE>
 ```
 
 - `--input` is repeatable. Keys are referenced as `inputs.<key>`.
-- `--dry-run` uses `DryRunClient` even if the Anthropic SDK + API key are
-  available.
+- `--from-ir` strictly loads canonical Workflow IR instead of source;
+  `--emit-ir PATH` compiles or normalizes IR and exits (`-` writes stdout). It
+  cannot combine with `--store`, `--resume`, or `--probe`.
+- `--backend` selects a real provider or deterministic dry-run and defaults to
+  `anthropic`; `--max-tokens` and `--timeout` configure provider calls.
+  `--dry-run` is shorthand for `--backend dry-run`. `--base-url` configures
+  the OpenAI-compatible endpoint.
+- `--store` enables durable trace/checkpoint persistence. `--resume` requires
+  `--store`, verifies the current definition and effective inputs against
+  stored identity, and reuses completed checkpoints. `--probe N` also requires
+  `--store`, cannot combine with `--resume`, and prints a persisted stability
+  report.
+- `--trace` prints structured trace events to stderr; `--metrics` prints
+  metrics derived from that trace.
 - If the selected real provider cannot be constructed and the program needs a
   model call, the CLI exits with an error. It never turns a real run into
   synthetic dry-run output; use `--dry-run` explicitly for plumbing checks.
 - A program with no model steps and `emit text` still runs without a provider,
   because its selected client is never called.
-- `--trace` prints structured trace events to stderr after the output.

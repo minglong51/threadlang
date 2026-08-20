@@ -81,7 +81,7 @@ JS build (server-rendered HTML with inline CSS, `dashboard.py`).
 | `src/threadlang/ir.py` | Load-bearing Workflow IR v1 contract: AST compilation, strict untrusted-JSON loading, canonical JSON bytes, SHA-256 fingerprints, and compatibility execution through `program_from_ir`/`run_ir`. It deliberately does not introduce a second interpreter. |
 | `src/threadlang/parser.py` | Position-aware lexer and recursive-descent parser. It consumes all source, handles strings/comments structurally, validates graph/reference availability, and raises line/column `ParseError` diagnostics. |
 | `src/threadlang/runtime.py` | Deterministic control-flow interpreter. `run_program(...) -> RuntimeResult`; runs llm steps with contracts, agent tool-use loops, forward routing, and emit. Storage-agnostic durability hooks carry traces, checkpoints, and resume outputs. |
-| `src/threadlang/llm.py` | Client backends behind two protocols: `LLMClient.complete` and `AgentLLMClient.agent_step`. `DryRunClient` (deterministic echo + two-phase agent stub), `OpenAICompatClient` (stdlib HTTP), `AnthropicClient` (SDK). |
+| `src/threadlang/llm.py` | Client backends behind a baseline protocol plus optional capabilities: `LLMClient.complete`, `AgentLLMClient.agent_step`, and `RouteLLMClient.route`. `DryRunClient` (deterministic echo + two-phase agent stub), `OpenAICompatClient` (stdlib HTTP), `AnthropicClient` (SDK). |
 | `src/threadlang/tools.py` | The agent execution boundary: `ToolSpec`/`Tool`/`FunctionTool`, `ToolRegistry` allow-list, deterministic built-ins `echo` + `calculator` (AST-walked arithmetic, no `eval`, no `**`, `tools.py`). |
 | `src/threadlang/trace.py` | `TraceEvent(phase, message, data)`, `Trace` alias, `DenialCode` enum. The durable record's unit. |
 | `src/threadlang/store.py` | Durability (L3): `RunStore` (sqlite tables `runs`/`events`/`step_outputs`, WAL/autocommit), canonical definition/input binding with legacy source fencing, bounded queue/retention, CAS resume, write-through traces, step checkpoints, replay, and metrics queries. |
@@ -91,7 +91,7 @@ JS build (server-rendered HTML with inline CSS, `dashboard.py`).
 | `src/threadlang/metrics.py` | Metrics (v0.8): `compute_metrics` — a pure fold over the trace into `RunMetrics` (deterministic control-flow counts vs observational latency/tokens, kept apart); `aggregate` rolls runs up per-program. |
 | `src/threadlang/apps/support_triage/` | Vertical slice (v0.7): `triage.thread` (agent classify+KB-search → llm draft), app tools `classify_priority`/`search_kb` over a bundled in-process KB (`kb.py`), and the `support-triage` entrypoint (`app.py`). Adds no core machinery. |
 | `docs/spec.md`, `docs/grammar.ebnf` | Language spec + EBNF grammar. |
-| `docs/design/phase-*.md` | The per-phase build plans (agentic core → durability → control plane → observability → vertical slice). |
+| `docs/design/phase-*.md` | Historical per-phase build plans (agentic core → durability → control plane → observability → vertical slice → routing → probes → contracts); HLD/LLD are the live architecture contracts. |
 | `examples/*.thread` | Runnable samples spanning interpolation, llm chains, agents, routing, contracts, and the release-report pipeline. |
 | `tests/` | Golden, per-version, IR, durability-policy, parser-pressure, provider-security, and server-hardening suites; live provider credentials are not required. |
 

@@ -95,12 +95,20 @@ Frozen dataclasses (immutable) shared by parser and runtime:
 
 ### `llm.py` — client backends
 
-Two protocols, both implemented by every backend:
+One baseline protocol plus two step-specific capabilities:
 
 - `LLMClient.complete(model: str, prompt: str) -> str` (`llm.py`) — plain
   `llm` steps and `emit llm`.
 - `AgentLLMClient.agent_step(model, messages: Sequence[Message],
-  tools: Sequence[ToolSpec]) -> AgentTurn` (`llm.py`).
+  tools: Sequence[ToolSpec]) -> AgentTurn` (`llm.py`) — required by `agent`
+  steps.
+- `RouteLLMClient.route(model, prompt, options: Sequence[str]) -> str`
+  (`llm.py`) — optional closed-label capability; the runtime falls back to
+  `complete` when it is absent.
+
+All built-in backends implement `complete` and `agent_step`; `DryRunClient`
+also implements `route` directly. The CLI's lazy wrapper exposes `route` and
+delegates to the selected backend's `complete` fallback when necessary.
 
 Shapes:
 
