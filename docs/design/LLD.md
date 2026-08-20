@@ -490,8 +490,9 @@ and a shell-quoted source.
 
 ### `policy.py` — fail-closed resource limits
 
-Module-level constants, no env override, imported by `ir.py`, `parser.py`,
-`runtime.py` and `server.py`. Its docstring is the scope statement worth keeping:
+Module-level constants, no env override, imported by `ir.py`, `llm.py`,
+`parser.py`, `runtime.py`, and `server.py`. Its docstring is the scope
+statement worth keeping:
 these are **conservative defaults for the single-node runtime, not
 distributed-runtime service-level guarantees** — a workload that needs more should
 split programs or put an authenticated admission layer in front of the server,
