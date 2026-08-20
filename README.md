@@ -7,7 +7,7 @@ workflows**. ThreadLang validates a workflow graph, executes model and tool
 calls within explicit limits, and records every binding, step, model turn, tool
 call, and result as a structured trace.
 
-The current source version is **v0.13.2 (alpha)**. It includes:
+The current source version is **v0.13.3 (alpha)**. It includes:
 
 - model and allow-listed [agentic tool-use steps](#agentic-steps-v03);
 - durable SQLite execution with [checkpoint, resume, and replay](#durability-v04);
@@ -50,7 +50,14 @@ thread TwoStep {
 
 ## Install
 
-ThreadLang is not published on PyPI yet. Install the current source:
+ThreadLang requires Python 3.11 or newer. Install the published package:
+
+```bash
+python -m pip install threadlang                # core + OpenAI-compatible backend, zero runtime deps
+python -m pip install 'threadlang[anthropic]'  # optional Anthropic client
+```
+
+Or install the current source:
 
 ```bash
 git clone https://github.com/minglong51/threadlang.git
@@ -120,6 +127,16 @@ vLLM, Together, …) over stdlib HTTP — no SDK. Tool-calling rides the OpenAI
 of emitting native `tool_calls` — use them for `llm`/`complete` steps, and
 DeepSeek (or Claude) for `agent` steps.
 
+Provider selection fails closed: a requested real backend never silently
+downgrades to dry-run output. `OPENAI_API_KEY` is read only for the official
+`https://api.openai.com` endpoint; compatible endpoints use
+`THREADLANG_API_KEY` or an explicit programmatic key. Keys require HTTPS unless
+the endpoint is loopback; loopback HTTP bypasses environment proxies, and
+unkeyed local HTTP endpoints remain supported. Provider redirects are refused,
+base URLs cannot embed credentials, query parameters, or fragments, and
+OpenAI-compatible response bodies are capped at 8 MiB. Invalid Unicode and
+malformed tool-call payloads fail closed before execution.
+
 ## Agentic steps (v0.3)
 
 An `agent` step is a model that can *act*. It runs a tool-use loop — model →
@@ -154,12 +171,13 @@ status. If it crashes, resume it from the last completed step — no re-running
 finished work.
 
 ```bash
-# Persist a run; prints run_id and (on failure) the resume command
+# Persist a run; retryable provider-call failures print a resume command
 threadlang examples/two_step.thread --input text="..." --backend openai --store runs.db
 
-# A crash prints:  run failed; resume with: --store runs.db --resume <id>
-threadlang examples/two_step.thread --input text="..." --backend openai \
-  --store runs.db --resume <id>          # skips completed steps, continues
+# A retryable provider-call failure prints a copyable command with the original backend settings.
+# Persisted inputs are loaded from the run; completed steps are skipped.
+threadlang examples/two_step.thread --store runs.db --resume <id> \
+  --backend openai
 ```
 
 ```python
@@ -202,10 +220,10 @@ curl localhost:8765/runs           # list all runs
 
 | Method / path | Does |
 |---|---|
-| `POST /runs` | enqueue `{source, inputs}` (program validated first) → `run_id` |
-| `GET /runs` | list runs (id, status, program, output) |
+| `POST /runs` | enqueue exactly one of `{source, inputs}` or `{ir, inputs}` (validated first) → `run_id` |
+| `GET /runs?limit=&offset=` | paginated run summaries |
 | `GET /runs/{id}` | one run: status, output, error, and the persisted trace |
-| `GET /healthz` | liveness |
+| `GET /healthz` / `GET /readyz` | database liveness / worker readiness + queue depth |
 
 Built from `process_one` (claim + run one queued run) and a `WorkerPool` of
 threads; the claim is atomic so no run executes twice. Details:
@@ -250,7 +268,7 @@ app-specific support.
 # one ticket, durably, in-process — deterministic, no key
 support-triage run --ticket "The dashboard is down with 500s, urgent" --dry-run
 
-# real model (DeepSeek native tool-calling, or local Ollama)
+# real model with native tool-calling (DeepSeek, Claude, or a compatible local model)
 support-triage run --ticket "..." --backend openai
 
 # or serve the API + workers + dashboard with the app's tool registry wired in
@@ -265,8 +283,10 @@ entrypoint. The one core change is `serve(tools=...)`, so any app can serve its
 own programs over the same API. `classify_priority` is deterministic keyword
 rules (no model call — cheap, inspectable); the model is spent only on the
 draft. Because the tools are pure and `DryRunClient` fires the first
-allow-listed tool, the whole product runs end-to-end under `--dry-run` and is
-golden-tested. Details:
+allow-listed tool with placeholder arguments, the plumbing runs end-to-end
+under `--dry-run` and is golden-tested. Dry-run does not validate ticket
+classification, KB-search coverage, or reply quality; use a real tool-calling
+model for those semantics. Details:
 [`docs/design/phase-5-vertical-slice.md`](docs/design/phase-5-vertical-slice.md).
 
 ## Metrics (v0.8)

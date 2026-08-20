@@ -1,14 +1,12 @@
 # ThreadLang — Low-Level Design
 
-Refreshed for v0.12. The supported boundary is one POSIX process and one local
+Refreshed for v0.13.3. The supported boundary is one POSIX process and one local
 SQLite store; see [`../production.md`](../production.md). Historical line
 references elsewhere in this document are explanatory and not API contracts.
 
-> **Refreshed 2026-08-09.** Adds `ir.py` (flagged by the drift check) and the five
-> `runs` columns the documented schema was missing — `program_sha256`,
-> `inputs_sha256`, `definition_json`, `definition_sha256`, `ir_version`. The
-> columns arrived by editing `store.py` in place, which the drift check cannot see;
-> only the new module flagged. Where this disagrees with the code, the code wins.
+> **Refreshed 2026-08-19.** Covers the shipped canonical-IR execution and
+> durable-binding path plus the v0.12 admission, recovery, and ownership
+> hardening. Where this disagrees with the code, the code wins.
 
 ## Module Breakdown
 
@@ -16,19 +14,23 @@ references elsewhere in this document are explanatory and not API contracts.
 
 Frozen dataclasses (immutable) shared by parser and runtime:
 
-- `ContextAssignment(name: str, value: str)` (`ast.py:7`);
-  `ContextBlock(assignments: List[ContextAssignment])` (`ast.py:13`)
-- Expression terms (`ExpressionTerm` union, `ast.py:40`): `StringLiteral(value)`
-  (`ast.py:18`), `ContextRef(name)` (`ast.py:23`), `InputsRef(name)`
-  (`ast.py:28`), `StepsRef(step_name)` — `steps.<name>.output` (`ast.py:33`)
-- `Expression(terms: List[ExpressionTerm])` (`ast.py:43`)
-- `Step(name, model, prompt: Expression)` — single-shot llm step (`ast.py:48`)
-- `AgentStep(name, model, prompt, tools: Tuple[str, ...] = (), max_iters: int = 6)`
-  — tool-use loop (`ast.py:61`); `StepNode = Union[Step, AgentStep]` (`ast.py:78`)
-- `StepsBlock(steps: List[StepNode] = [])` (`ast.py:81`)
+- `ContextAssignment(name: str, value: str)` (`ast.py`);
+  `ContextBlock(assignments: List[ContextAssignment])` (`ast.py`)
+- Expression terms: `StringLiteral(value)`, `ContextRef(name)`,
+  `InputsRef(name)`, and `StepsRef(step_name, optional=False)`; the optional
+  form represents `steps.<name>.output?` on branch joins.
+- `Expression(terms: List[ExpressionTerm])` (`ast.py`)
+- `ExpectRule(kind, values, pattern, limit)` plus `Step(name, model, prompt,
+  next_target=None, expect=())` — contracted single-shot llm step.
+- `AgentStep(name, model, prompt, tools=(), max_iters=6, next_target=None)` —
+  bounded tool-use loop with an optional explicit edge.
+- `RouteArm(label, target)` and `RouteStep(name, model, prompt, arms,
+  else_target=None)` — closed-label forward dispatch.
+- `StepNode = Union[Step, AgentStep, RouteStep]`.
+- `StepsBlock(steps: List[StepNode] = [])` (`ast.py`)
 - `EmitBlock(kind: str, expression: Expression, model: Optional[str] = None)` —
-  `kind ∈ {"text","llm"}`; `model` only for `llm` (`ast.py:86`)
-- `Program(thread_name, context, steps, emit)` (`ast.py:100`)
+  `kind ∈ {"text","llm"}`; `model` only for `llm` (`ast.py`)
+- `Program(thread_name, context, steps, emit)` (`ast.py`)
 
 ### `parser.py` — position-aware recursive-descent parser
 
@@ -46,230 +48,221 @@ Frozen dataclasses (immutable) shared by parser and runtime:
 
 - `run_program(program, inputs, llm_client=None, tools=None, *, trace=None,
   resume_outputs=None, on_step_complete=None) -> RuntimeResult`
-  (`runtime.py:51`). Defaults: `DryRunClient()` (`runtime.py:84`),
-  `default_registry()` (`runtime.py:85`). The three keyword hooks are the
+  (`runtime.py`). Defaults: `DryRunClient()` and `default_registry()`. The three keyword hooks are the
   durability seam used by `store.run_durable` — the runtime never sees storage
-  (`runtime.py:71`).
+  (`runtime.py`).
 - `RuntimeResult(output: str, trace: Trace, step_outputs: Dict[str, str])`
-  (`runtime.py:44`).
-- `_build_context(program, trace) -> Dict[str, str]` (`runtime.py:99`) — one
+  (`runtime.py`).
+- `_build_context(program, trace) -> Dict[str, str]` (`runtime.py`) — one
   `context` trace event per assignment.
-- `_run_steps(...)` (`runtime.py:113`) — declaration order. If a step name is
-  in `resume_outputs` it is skipped, its stored output reused, and the skip
-  traced with `resumed: True` (`runtime.py:125`). Dispatches `AgentStep` vs
-  `Step`; calls `on_step_complete(name, output)` after each fresh step
-  (`runtime.py:145`).
-- `_run_llm_step(...)` (`runtime.py:150`) — render prompt, trace
-  "Calling LLM for step", `client.complete(model, prompt)` (any exception
-  wrapped in `RuntimeError`, `runtime.py:168`), trace "produced output".
-- `_run_agent_step(...) -> str` (`runtime.py:182`) — the tool-use loop:
+- `_run_steps(...)` walks the forward-only graph from the first declaration.
+  A checkpointed step is skipped, its stored output reused, and the resume is
+  traced. Fresh `Step`, `AgentStep`, and `RouteStep` nodes dispatch to their
+  specific executor; routing or `then ->` selects the next index, and each
+  fresh output is checkpointed through `on_step_complete`.
+- `_run_llm_step(...)` renders the prompt, calls `complete`, and enforces every
+  `expect` rule. A violation is traced and retried once with feedback; a second
+  violation fails the run. `one_of` may use the optional `route` client method.
+- `_run_route_step(...)` asks for one label from the declared arm set, retries
+  one invalid answer, then follows the matching arm, `else`, or fails closed.
+- `_run_agent_step(...) -> str` (`runtime.py`) — the tool-use loop:
   1. Requires the client to expose `agent_step` (duck-typed via `getattr`;
-     `RuntimeError` otherwise, `runtime.py:196`).
+     `RuntimeError` otherwise, `runtime.py`).
   2. Validates every allow-listed tool exists in the registry
-     (`runtime.py:203`); collects `specs` and the `allowed` set.
+     (`runtime.py`); collects `specs` and the `allowed` set.
   3. Seeds `messages = [{"role": "user", "content": prompt}]`, traces
-     "Agent ... started" with tools + max_iters (`runtime.py:213`).
+     "Agent ... started" with tools + max_iters (`runtime.py`).
   4. Up to `max_iters` turns: call `agent_step(model, messages, tools=specs)`;
      trace the turn (text + tool_calls). Empty `tool_calls` → trace
-     "finished", return `response.text` (`runtime.py:251`).
+     "finished", return `response.text` (`runtime.py`).
   5. Otherwise append the assistant message and, per call: if allowed **and**
      registered, `registry.get(name).run(arguments)` — a raising tool becomes
-     an observable `"error: ..."` string, not a crash (`runtime.py:267`);
+     an observable `"error: ..."` string, not a crash (`runtime.py`);
      else a `phase="denial"` event with `DenialCode.TOOL_NOT_ALLOWED` /
-     `TOOL_NOT_REGISTERED` (`runtime.py:283`). Results feed back as
-     `{"role": "tool", "tool_call_id": ...}` messages (`runtime.py:302`).
+     `TOOL_NOT_REGISTERED` (`runtime.py`). Results feed back as
+     `{"role": "tool", "tool_call_id": ...}` messages (`runtime.py`).
   6. Loop exhaustion raises `RuntimeError("... exceeded max_iters ...")`
-     (`runtime.py:306`).
-- `_evaluate_emit(...)` (`runtime.py:311`) — `text` → concat with per-term
-  tracing; `llm` → render, assert model (parser invariant, `runtime.py:323`),
+     (`runtime.py`).
+- `_evaluate_emit(...)` (`runtime.py`) — `text` → concat with per-term
+  tracing; `llm` → render, assert model (parser invariant, `runtime.py`),
   call the client (wrapped on failure); unknown kind raises.
 - `_render_expression(expression, context, inputs, step_outputs, trace=None)`
-  (`runtime.py:340`) — resolves terms; missing context/input or a
-  forward/unknown step reference raises `RuntimeError` (`runtime.py:354`,
-  `runtime.py:359`, `runtime.py:363`). Per-term trace events only when `trace`
-  is passed — only `emit text` passes it (`runtime.py:320`).
-- `RuntimeError(ValueError)` (`runtime.py:40`) — shadows the builtin
-  deliberately; re-exported by the package (`__init__.py:23`).
+  (`runtime.py`) — resolves terms; missing context/input or a
+  forward/unknown step reference raises `RuntimeError`. Per-term trace events only when `trace`
+  is passed — only `emit text` passes it (`runtime.py`).
+- `RuntimeError(ValueError)` (`runtime.py`) — shadows the builtin
+  deliberately; re-exported by the package (`__init__.py`).
 
 ### `llm.py` — client backends
 
 Two protocols, both implemented by every backend:
 
-- `LLMClient.complete(model: str, prompt: str) -> str` (`llm.py:28`) — plain
+- `LLMClient.complete(model: str, prompt: str) -> str` (`llm.py`) — plain
   `llm` steps and `emit llm`.
 - `AgentLLMClient.agent_step(model, messages: Sequence[Message],
-  tools: Sequence[ToolSpec]) -> AgentTurn` (`llm.py:63`).
+  tools: Sequence[ToolSpec]) -> AgentTurn` (`llm.py`).
 
 Shapes:
 
-- `ToolCall(id, name, arguments: Dict[str, object])` (`llm.py:35`)
+- `ToolCall(id, name, arguments: Dict[str, object])` (`llm.py`)
 - `AgentTurn(text, tool_calls: Sequence[ToolCall] = ())` — empty `tool_calls`
-  means done (`llm.py:45`)
+  means done (`llm.py`)
 - `Message = Dict[str, object]` — the runtime-owned normalized message; roles
   `user` / `assistant` (text + tool_calls) / `tool` (tool_call_id + content)
-  (`llm.py:56`)
-- `LLMError(RuntimeError)` (`llm.py:73`)
+  (`llm.py`)
+- `LLMError(RuntimeError)` (`llm.py`)
 
 Backends:
 
-- `DryRunClient` (`llm.py:92`) — `complete` returns
+- `DryRunClient` (`llm.py`) — `complete` returns
   `f"[dry-run:{model}] {prompt}"`. `agent_step` is a deterministic two-phase
   loop: if tools exist and no tool has run yet, call the *first* tool with
   placeholder args deterministically derived from its JSON schema
-  (`_placeholder_args`, `llm.py:77`); otherwise finalize, echoing the latest
-  tool/user observation (`llm.py:99`). Makes agent programs golden-testable.
-- `AnthropicClient(api_key=None, max_tokens=1024)` (`llm.py:128`) — lazy-imports
-  the SDK (`LLMError` if absent, `llm.py:136`), reads `ANTHROPIC_API_KEY`
-  (`llm.py:143`). `agent_step` maps normalized messages ↔ Anthropic content
+  (`_placeholder_args`, `llm.py`); otherwise finalize, echoing the latest
+  tool/user observation (`llm.py`). Makes agent programs golden-testable.
+- `AnthropicClient(api_key=None, max_tokens=1024)` (`llm.py`) — lazy-imports
+  the SDK (`LLMError` if absent, `llm.py`), reads `ANTHROPIC_API_KEY`
+  (`llm.py`). `agent_step` maps normalized messages ↔ Anthropic content
   blocks (`tool_use` / `tool_result`) via `_to_anthropic_messages`
-  (`llm.py:194`).
+  (`llm.py`).
 - `OpenAICompatClient(base_url=None, api_key=None, max_tokens=1024,
-  timeout=120.0)` (`llm.py:232`) — any `/v1/chat/completions` server over
-  stdlib `urllib` (`_post`, `llm.py:269`). Defaults: `THREADLANG_BASE_URL` or
-  DeepSeek (`llm.py:229`); key from `THREADLANG_API_KEY` or `OPENAI_API_KEY`,
-  optional for local servers (`llm.py:261`). HTTP/URL/JSON failures raise
-  `LLMError` with truncated detail (`llm.py:280`). Tool-calling rides the
-  OpenAI `tools`/`tool_calls` shape (`_to_openai_messages`, `llm.py:351`;
+  timeout=120.0)` (`llm.py`) — any `/v1/chat/completions` server over
+  stdlib `urllib` (`_post`, `llm.py`). Defaults: `THREADLANG_BASE_URL` or
+  DeepSeek. An explicit key or `THREADLANG_API_KEY` applies to compatible
+  endpoints; ambient `OPENAI_API_KEY` is used only when the endpoint is
+  `https://api.openai.com`. Keys are optional for local servers and keyed HTTP
+  is accepted only for loopback endpoints, using a proxy-disabled opener.
+  Endpoint URLs containing userinfo, a query, or a fragment are rejected, and
+  provider redirects are refused. HTTP/URL/JSON failures raise `LLMError`;
+  upstream HTTP bodies and endpoint details are never copied into durable
+  errors.
+  Tool-calling rides the
+  OpenAI `tools`/`tool_calls` shape (`_to_openai_messages`, `llm.py`;
   defensive `choices[0].message` extraction in `_openai_message`,
-  `llm.py:340`; malformed tool-call arguments degrade to `{}`, `llm.py:326`).
-- `default_client() -> LLMClient` returns `AnthropicClient()` (`llm.py:387`).
+  `llm.py`). Responses over 8 MiB, invalid Unicode/text shapes, and malformed
+  or non-object tool-call arguments raise `LLMError` before tool execution.
+- `default_client() -> LLMClient` returns `AnthropicClient()` (`llm.py`).
 
 Both HTTP clients hold no mutable per-call state — the thread-safety contract
-the shared-client `WorkerPool` relies on (`control.py:66`).
+the shared-client `WorkerPool` relies on (`control.py`).
 
 ### `tools.py` — the execution boundary
 
 - `ToolSpec(name, description, parameters: Dict[str, object])` — the JSON
-  schema the model sees (`tools.py:32`).
-- `Tool` Protocol: `.spec` + `.run(args: Mapping) -> str` (`tools.py:43`);
-  `FunctionTool(spec, _fn)` wraps a plain callable (`tools.py:49`).
-- `ToolRegistry` (`tools.py:61`) — `register` (rejects duplicates), `has`,
+  schema the model sees (`tools.py`).
+- `Tool` Protocol: `.spec` + `.run(args: Mapping) -> str` (`tools.py`);
+  `FunctionTool(spec, _fn)` wraps a plain callable (`tools.py`).
+- `ToolRegistry` (`tools.py`) — `register` (rejects duplicates), `has`,
   `get`, `specs(names)`, `names()`. An agent step references tools by name;
   only the registry turns a name into code.
-- Built-ins (`default_registry()`, `tools.py:181`): `echo` (`tools.py:95`) and
-  `calculator` (`tools.py:162`). The calculator parses with `ast.parse` and
-  walks the tree (`_eval_arithmetic`, `tools.py:125`) — only numeric literals
+- Built-ins (`default_registry()`, `tools.py`): `echo` (`tools.py`) and
+  `calculator` (`tools.py`). The calculator parses with `ast.parse` and
+  walks the tree (`_eval_arithmetic`, `tools.py`) — only numeric literals
   and whitelisted operators (`+ - * / // % `, unary `+/-`); `**` is excluded as
-  a DoS vector (`tools.py:108`). Errors return `"error: ..."` strings.
+  a DoS vector (`tools.py`). Errors return `"error: ..."` strings.
 
 ### `trace.py`
 
 - `TraceEvent(phase: str, message: str, data: Dict[str, Any] = {})`
-  (`trace.py:13`); `Trace = List[TraceEvent]` (`trace.py:20`).
+  (`trace.py`); `Trace = List[TraceEvent]` (`trace.py`).
 - `DenialCode(str, Enum)`: `TOOL_NOT_ALLOWED = "tool-not-allowed"`,
-  `TOOL_NOT_REGISTERED = "tool-not-registered"` (`trace.py:8`).
-- Phases in use: `context`, `step`, `agent`, `denial`, `runtime`, `emit`
-  (colors in `dashboard.py:80`).
+  `TOOL_NOT_REGISTERED = "tool-not-registered"` (`trace.py`).
+- Phases in use: `context`, `step`, `agent`, `route`, `contract`, `denial`,
+  `runtime`, `emit`
+  (colors in `dashboard.py`).
 
 ### `store.py` — durable run store
 
-- `RunStore(path)` (`store.py:86`) — stdlib sqlite, `isolation_level=None`
-  (autocommit: every write durable immediately, `store.py:93`),
-  `busy_timeout = 5000` for cross-thread claims (`store.py:98`), schema
-  applied idempotently plus `_migrate()` which `ALTER TABLE`s `events.ts` onto
-  pre-v0.8 stores (`store.py:102`).
-- `RunRecord(id, program_name, status, inputs, output, error, source=None)`
-  (`store.py:75`).
-- Runs: `create_run(program_name, inputs) -> run_id` (status `running`,
-  `store.py:130`), `get_run`, `list_runs()` (newest first, `store.py:144`),
-  `mark_running/mark_completed/mark_failed` (`store.py:201`).
-- Queue: `enqueue_run(program_name, source, inputs)` inserts `pending` with the
-  program source (`store.py:153`); `claim_next_pending()` takes the oldest
-  pending under `BEGIN IMMEDIATE` and flips it to `running` — the atomic claim
-  that guarantees single execution (`store.py:168`).
-- Events: `append_event(run_id, event)` assigns `seq = MAX(seq)+1` and stamps
-  wall-clock `ts` (`store.py:221`); `load_events(run_id) -> Trace`
-  (`store.py:232`).
-- Checkpoints: `save_step_output` (upsert, `store.py:244`) /
-  `load_step_outputs` (`store.py:251`).
-- Metrics queries: `run_metrics(run_id) -> Optional[RunMetrics]` (fold of the
-  persisted trace + timestamp span, `store.py:265`); `aggregate_metrics()`
-  (`store.py:277`).
-- `_WriteThroughTrace(List[TraceEvent])` (`store.py:292`) — overrides `append`
-  to also persist; the runtime appends through it unknowingly.
-- `run_durable(program, inputs, store, *, llm_client=None, tools=None,
-  run_id=None) -> DurableRun` (`store.py:317`):
-  - `run_id` of a **completed** run → replay: return the stored output, events,
-    and step outputs with no model calls (`store.py:340`).
-  - `run_id` of a failed/running run → resume: preload `step_outputs` as
-    `resume_outputs`, `mark_running` (`store.py:350`).
-  - No `run_id` → `create_run`. Then execute `run_program` with the
-    write-through trace and a checkpoint closure; any exception →
-    `mark_failed` + re-raise (`store.py:370`); success → `mark_completed`.
-  - `DurableRun(run_id, result: RuntimeResult)` (`store.py:308`).
+- `RunStore(path)` opens a per-thread stdlib sqlite connection in WAL mode,
+  enables foreign keys and a five-second busy timeout, applies the schema, and
+  performs additive migrations. Writes use autocommit.
+- `RunRecord` includes status/output/error plus optional source, source/input
+  digests, canonical `definition_json`, definition digest, IR version, and
+  timestamps.
+- `create_run(...)` inserts `created`; `mark_running(expected=...)` is a
+  compare-and-swap transition that fences concurrent CLI resumes.
+- `enqueue_run(...)` and `enqueue_ir(...)` bind canonical definition and input identity,
+  enforce the pending limit, prune terminal retention, and insert `pending`
+  under `BEGIN IMMEDIATE`. `claim_next_pending()` atomically claims the oldest
+  row. `requeue_orphans()` moves restart-stranded sourced/IR runs back to
+  `pending`.
+- Events are sequenced and timestamped; step outputs are upserted checkpoints.
+  Per-run and aggregate metrics are folds over those persisted events.
+- `run_durable(...)` compiles the current program to canonical IR and binds its
+  digest with canonical inputs. The source digest remains metadata and the
+  identity fence for legacy rows lacking canonical definition identity. Resume
+  verifies stored IR integrity, definition/input identity, IR version, and
+  eligible status before it loads checkpoints. A completed run replays without
+  model calls; a fresh run moves `created→running`; any execution exception
+  marks `failed`; success marks `completed`.
 
 ### `control.py` — worker pool
 
 - `process_one(store, *, llm_client=None, tools=None) -> Optional[DurableRun]`
-  (`control.py:31`) — claim, `parse_program(claimed.source)`, `run_durable`
-  with the claimed id. A raising run is already marked failed; the exception is
-  swallowed so one bad run never kills a worker (`control.py:55`). Returns
-  `None` on empty queue.
+  claims one row, loads its bound canonical IR when present (or parses legacy
+  source), and calls `run_durable` with the claimed id. Every malformed or
+  raising run is marked failed and contained so one job cannot kill a worker.
 - `WorkerPool(store_path, *, n_workers=2, llm_client=None, tools=None,
-  poll_interval=0.05)` (`control.py:61`) — `start()` spawns daemon threads
-  (`control.py:87`); each `_loop` opens its **own** `RunStore` (sqlite
-  connections are per-thread, `control.py:94`) and polls `process_one`,
-  waiting `poll_interval` on empty. `stop(timeout=5.0)` joins; `drain(store,
-  max_runs=10_000)` processes synchronously in the current thread (tests /
-  batch mode, `control.py:112`).
+  poll_interval=0.05)` acquires `<store>.worker.lock`, requeues orphaned
+  `running` rows, then starts daemon threads with one `RunStore` each. The loop
+  contains store/provider infrastructure errors; `is_healthy()`/`status()`
+  expose thread liveness. `stop()` joins and releases the lock; `drain()` is
+  the synchronous batch/test path and continues past failed jobs.
 
 ### `server.py` — HTTP API + dashboard host
 
-- `_Handler(BaseHTTPRequestHandler)` (`server.py:32`) on a
-  `ThreadingHTTPServer`; each request opens/closes its own `RunStore`
-  (`server.py:37`, `server.py:112`).
-- `do_GET` (`server.py:59`): `/` and `/ui` → `render_run_list(list_runs,
-  aggregate_metrics)`; `/ui/runs/{id}` → `render_run_detail(record, events,
-  run_metrics)` (HTML 404 for unknown); `/healthz` → `{"ok": true}`;
-  `/metrics` → `aggregate_metrics().to_dict()`; `/runs/{id}/metrics`;
-  `/runs` (summaries); `/runs/{id}` (summary + full `trace` array). JSON 404
-  otherwise.
-- `do_POST /runs` (`server.py:115`): validates JSON body, requires non-empty
-  string `source` and dict `inputs`, **parses the program before enqueuing**
-  (400 with `parse error: ...` on `ParseError`, `server.py:134`), stringifies
-  input keys/values, returns `201 {"run_id", "status": "pending"}`.
-- `make_server(store_path, host="127.0.0.1", port=8765)` (`server.py:159`) —
-  builds the server, stashing `store_path` on it.
-- `serve(store_path, *, host, port, n_workers=2, llm_client=None, tools=None)`
-  (`server.py:166`) — starts the `WorkerPool` then blocks in
-  `serve_forever()`; `tools` is the seam apps use to serve their own registries
-  (`server.py:177`). `main()` (`server.py:197`) is the `threadlang-serve`
-  script: `--store` (required), `--host`, `--port`, `--workers`,
-  `--backend dry-run|anthropic|openai` (default **dry-run**), `--base-url`.
+- `_Handler(BaseHTTPRequestHandler)` runs on `ThreadingHTTPServer`; each data
+  request opens and closes its own `RunStore`. JSON and HTML responses set
+  no-store, nosniff, and frame-denial headers; HTML also has a restrictive CSP.
+- Tokenless mode admits only loopback Host/origin traffic. A configured bearer
+  token gates every data, dashboard, metrics, and submission route;
+  `/healthz` and `/readyz` intentionally reveal only database, worker, and
+  pending/running queue state.
+- `GET /runs` is bounded and paginated; run detail includes the trace. Metrics,
+  dashboard list/detail, liveness, and readiness have dedicated routes.
+- `POST /runs` requires JSON content type and bounded length, exactly one of
+  non-empty UTF-8 `.thread` source or an IR object, and bounded string inputs.
+  Source is parsed+compiled and IR is strictly loaded before the canonical
+  definition is enqueued. Capacity exhaustion returns 429; validation returns
+  4xx without creating a row.
+- `make_server(...)` validates bind/auth/admission settings. `serve(...)`
+  starts the exclusive `WorkerPool` and HTTP server together and stops both on
+  shutdown. The `threadlang-serve` CLI defaults to loopback + dry-run and
+  exposes provider, worker, queue, retention, timeout, and auth-token-env knobs.
 
 ### `dashboard.py` — pure HTML renderers
 
 - `render_run_list(runs: List[RunRecord], aggregate: Optional[AggregateMetrics])
-  -> str` (`dashboard.py:167`) — table of id/program/status/output-or-error
-  with an aggregate metrics chip panel (`_aggregate_panel`, `dashboard.py:149`);
-  meta-refresh every 1s while any run is pending/running (`dashboard.py:195`).
-- `render_run_detail(record, events, metrics=None) -> str` (`dashboard.py:199`)
+  -> str` (`dashboard.py`) — table of id/program/status/output-or-error
+  with an aggregate metrics chip panel (`_aggregate_panel`, `dashboard.py`);
+  meta-refresh every 1s while any run is pending/running (`dashboard.py`).
+- `render_run_detail(record, events, metrics=None) -> str` (`dashboard.py`)
   — header (status badge, inputs, output/error), per-run metric chips
-  (`_run_metrics_panel`, `dashboard.py:129`; warn styling for tool errors /
+  (`_run_metrics_panel`, `dashboard.py`; warn styling for tool errors /
   denials / resumed steps), then the phase-colored `TraceEvent` timeline
-  (`_PHASE_COLOR`, `dashboard.py:80`). If `metrics` is omitted it is derived
-  from `events` alone (`dashboard.py:208`).
+  (`_PHASE_COLOR`, `dashboard.py`). If `metrics` is omitted it is derived
+  from `events` alone (`dashboard.py`).
 - Every interpolated value passes `_esc` = `html.escape(..., quote=True)`
-  (`dashboard.py:90`) — model output and trace data are untrusted.
+  (`dashboard.py`) — model output and trace data are untrusted.
 
 ### `metrics.py` — derived metrics
 
-- `RunMetrics` (`metrics.py:46`) — deterministic block: `context_vars`,
+- `RunMetrics` (`metrics.py`) — deterministic block: `context_vars`,
   `steps_completed`, `agent_steps`, `agent_turns`, `model_calls`
-  (= complete calls + agent turns, `metrics.py:169`), `tool_calls`,
+  (= complete calls + agent turns, `metrics.py`), `tool_calls`,
   `tool_errors`, `denials`, `resumed_steps`, `status`; observational block:
   `duration_ms`, `input_tokens`, `output_tokens` (all Optional — `None` means
   "not recorded", not zero). Properties `ok`, `total_tokens`; `to_dict()`
-  nests `{deterministic, observational}` (`metrics.py:82`).
+  nests `{deterministic, observational}` (`metrics.py`).
 - `compute_metrics(trace, *, status=None, duration_ms=None) -> RunMetrics`
-  (`metrics.py:105`) — a pure fold matching exactly the event shapes
-  `runtime.run_program` appends (phase/message patterns, `metrics.py:128`).
+  (`metrics.py`) — a pure fold matching exactly the event shapes
+  `runtime.run_program` appends (phase/message patterns, `metrics.py`).
   Token usage is read from any event `data.usage` dict; the built-in clients
-  don't emit it yet (`metrics.py:27`).
-- `trace_span_ms(timestamps) -> Optional[float]` (`metrics.py:181`) — first-to-
+  don't emit it yet (`metrics.py`).
+- `trace_span_ms(timestamps) -> Optional[float]` (`metrics.py`) — first-to-
   last ISO timestamp span; `None` under two parseable stamps (pre-v0.8 rows).
-- `AggregateMetrics` (`metrics.py:198`) + `aggregate(items:
-  Sequence[Tuple[str, RunMetrics]])` (`metrics.py:228`) — `by_status`,
+- `AggregateMetrics` (`metrics.py`) + `aggregate(items:
+  Sequence[Tuple[str, RunMetrics]])` (`metrics.py`) — `by_status`,
   `success_rate` = completed/(completed+failed) over terminal runs only,
   `avg_duration_ms`, call/error/denial totals, and a `by_program` breakdown.
 
@@ -277,30 +270,29 @@ the shared-client `WorkerPool` relies on (`control.py:66`).
 
 - `triage.thread` — `SupportTriage`: agent step `investigate`
   (`deepseek-chat`, `tools [ classify_priority, search_kb ]`, `max_iters 5`)
-  → llm step `draft` → `emit text { steps.draft.output }`
-  (`triage.thread:1`).
-- `app.py` — `PROGRAM_PATH` points at the bundled program (`app.py:34`;
-  shipped via package-data, `pyproject.toml:23`); `load_program()`
-  (`app.py:37`); `main()` (`app.py:60`) with subcommands:
+  → llm step `draft` → `emit text { steps.draft.output }`.
+- `app.py` — `PROGRAM_PATH` points at the bundled program (`app.py`;
+  shipped via package-data, `pyproject.toml`); `load_program()`
+  (`app.py`); `main()` (`app.py`) with subcommands:
   - `serve --store ... [--host --port --workers --backend --base-url]` →
-    `serve(..., tools=build_registry())` (`app.py:83`).
+    `serve(..., tools=build_registry())` (`app.py`).
   - `run --ticket ... [--store triage-runs.db] [--dry-run --backend --base-url]`
     → `run_durable(load_program(), {"ticket": ...}, store, tools=registry)`;
-    prints `run_id`/status + output; exit 0 iff completed (`app.py:107`).
+    prints `run_id`/status + output; exit 0 iff completed (`app.py`).
 - `tools.py` — `classify_priority`: deterministic keyword rules mapping ticket
-  text to P0/P1/P2 (`_P0_SIGNALS`/`_P1_SIGNALS`, `tools.py:28`; `_classify`,
-  `tools.py:45`). `search_kb`: token-overlap scoring over the bundled articles,
-  tag hits weighted double, top 2 returned (`_score`, `tools.py:65`;
-  `_search_kb`, `tools.py:73`). `build_registry()` = `default_registry()` +
-  both (`tools.py:128`).
-- `kb.py` — `Article(id, title, body, tags)` (`kb.py:17`) and the four-article
-  in-process `ARTICLES` list (`kb.py:25`). Swapping in a real store is a
-  tool-implementation detail (`kb.py:6`).
+  text to P0/P1/P2 (`_P0_SIGNALS`/`_P1_SIGNALS`, `tools.py`; `_classify`,
+  `tools.py`). `search_kb`: token-overlap scoring over the bundled articles,
+  tag hits weighted double, top 2 returned (`_score`, `tools.py`;
+  `_search_kb`, `tools.py`). `build_registry()` = `default_registry()` +
+  both (`tools.py`).
+- `kb.py` — `Article(id, title, body, tags)` (`kb.py`) and the four-article
+  in-process `ARTICLES` list (`kb.py`). Swapping in a real store is a
+  tool-implementation detail (`kb.py`).
 
-### `ir.py` — versioned canonical IR (724 lines)
+### `ir.py` — versioned canonical IR
 
 `IR_VERSION = "threadlang.ir/v1"`, `LANGUAGE_VERSION = "threadlang/v0.12"`
-(`ir.py:47-48`). IR v1 losslessly represents the v0.12 source AST for inspection,
+(`ir.py`). IR v1 losslessly represents the v0.12 source AST for inspection,
 stable serialization, and definition fingerprints.
 
 **It is not a second interpreter.** The docstring is explicit: the existing runtime
@@ -310,65 +302,77 @@ separately reviewed and verified. Read that as a deliberate refusal, not a gap.
 
 - Frozen node types mirroring the AST: `IRContextEntry`, `IRTerm`, `IRExpression`,
   `IRExpectation`, `IRRouteArm`, `IRLLMStep`, `IRAgentStep`, `IRRouteStep`,
-  `IREmit`, and the `WorkflowIR` root (`ir.py:56-138`).
-- `compile_program(program: Program) -> WorkflowIR` (`:207`) — AST → IR.
-- `program_from_ir(workflow: WorkflowIR) -> Program` (`:279`) — the bridge back;
+  `IREmit`, and the `WorkflowIR` root (`ir.py`).
+- `compile_program(program: Program) -> WorkflowIR` (`ir.py`) — AST → IR.
+- `program_from_ir(workflow: WorkflowIR) -> Program` (`ir.py`) — the bridge back;
   this is what lets a stored definition execute on the existing runtime.
-- `load_ir_bytes(payload: bytes) -> WorkflowIR` (`:659`) — parse + validate;
-  raises `IRCompileError` (`:51`).
-- `canonical_ir_bytes(workflow) -> bytes` (`:712`) — UTF-8 JSON with `sort_keys` and
+- `run_ir(workflow, inputs, llm_client=None, tools=None) -> RuntimeResult`
+  (`ir.py`) is the explicit compatibility execution entry point.
+- `load_ir_bytes(payload: bytes) -> WorkflowIR` (`ir.py`) — parse + validate;
+  raises `IRCompileError`.
+- `canonical_ir_bytes(workflow) -> bytes` (`ir.py`) — UTF-8 JSON with `sort_keys` and
   `(",", ":")` separators. The canonicalization is the point: identity must not
   change because a dict happened to iterate differently.
-- `workflow_fingerprint(workflow) -> str` (`:722`) — SHA-256 of those bytes.
+- `workflow_fingerprint(workflow) -> str` (`ir.py`) — SHA-256 of those bytes.
 
 Imported by `store.py`, `server.py`, `control.py`, `cli.py`, and re-exported from
 `__init__.py`, which makes it a load-bearing contract rather than a utility.
 
 ### `cli.py` — `threadlang` entry point
 
-- `main() -> int` (`cli.py:26`) — args: `source` (positional Path),
-  `--input k=v` (repeatable, `_parse_inputs` splits on first `=`, `cli.py:16`),
+- `main() -> int` (`cli.py`) — args: `source` (positional Path),
+  `--input k=v` (repeatable, `_parse_inputs` splits on first `=`, `cli.py`),
   `--backend dry-run|anthropic|openai` (default **anthropic**), `--dry-run`
-  (shorthand), `--base-url`, `--store PATH`, `--resume RUN_ID` (requires
-  `--store`, exit 2 otherwise, `cli.py:83`), `--trace`, `--metrics`.
-- Client selection (`cli.py:92`): dry-run / openai / anthropic; a failed
-  `AnthropicClient()` soft-falls-back to `DryRunClient`, warning only if the
-  program actually needs a model (`cli.py:100`).
+  (shorthand), `--base-url`, provider limits, `--store PATH`, `--resume
+  RUN_ID`, `--probe N`, `--trace`, `--metrics`, `--from-ir`, and `--emit-ir`.
+- Client selection is dry-run / OpenAI-compatible / Anthropic. A workflow that
+  needs a model fails closed when the selected real client is unavailable; a
+  pure `emit text` workflow can continue because it never calls the client.
 - With `--store`: establishes the run id up front so it can be reported even on
-  a crash (`cli.py:119`), runs `run_durable`; on `LLMError`/`RuntimeError`
-  prints the exact resume command and exits 1 (`cli.py:126`). Without:
+  a crash, then runs `run_durable`; provider-call failures print a shell-quoted
+  resume command preserving source/IR mode, provider, endpoint, token limit,
+  and timeout, then exit 1. Deterministic runtime failures exit 1 without an
+  unusable retry hint. Definition/input/status refusals exit 2. Without a store:
   plain `run_program`, metrics computed from the in-memory trace with
-  `status="completed"` (`cli.py:144`).
+  `status="completed"` (`cli.py`).
 - Output to stdout; `run_id`, trace lines, and metrics JSON to stderr.
 
 ## Data Models
 
 ### `.thread` source contract
 
-Per `docs/grammar.ebnf` and `docs/spec.md` (spec text predates v0.3 — the
-grammar file and parser are current):
+The normative grammar is `docs/grammar.ebnf`; this excerpt shows the execution
+shape:
 
 ```
 program     = "thread" name "{" context [ steps ] emit "}"
 context     = "context" "{" { name "=" string } "}"
 steps       = "steps" "{" { step } "}"
-step        = "step" name "{" llm_body | agent_body "}"
-llm_body    = "llm" string "{" expression "}"
+step        = "step" name "{" llm_body | agent_body | route_body "}"
+llm_body    = "llm" string "{" expression [ expect ] [ then_decl ] "}"
 agent_body  = "agent" string "{" [ "tools" "[" name {"," name} "]" ]
-                               [ "max_iters" int ] expression "}"
+                               [ "max_iters" int ] expression [ then_decl ] "}"
+route_body  = "route" string "{" expression arm { arm } [ else_decl ] "}"
+arm         = "on" string "->" target
+expect      = "expect" "{" expect_rule { expect_rule } "}"
+expect_rule = one_of | matches | max_chars | nonempty
+then_decl   = "then" "->" target
+target      = name | "end"
 emit        = "emit" "text" "{" expression "}"
             | "emit" "llm" string "{" expression "}"
 expression  = term { "+" term }
-term        = string | "context." name | "inputs." name | "steps." name ".output"
+term        = string | "context." name | "inputs." name
+            | "steps." name ".output" [ "?" ]
 ```
 
 Constraints: `context` required, `steps` optional, exactly one `emit`, unique
-step names, `max_iters >= 1`, tool names must be identifiers.
+step names, bounded `max_iters`, tool names must be identifiers, and all graph
+edges/references must be statically valid and forward-only.
 
-### sqlite schema (`store.py:41`)
+### sqlite schema (`store.py`)
 
 ```sql
-runs (id TEXT PK, program_name TEXT, status TEXT,   -- pending|running|completed|failed
+runs (id TEXT PK, program_name TEXT, status TEXT,   -- created|pending|running|completed|failed
       inputs_json TEXT, source TEXT,                -- source set when enqueued via the API
       program_sha256 TEXT, inputs_sha256 TEXT,      -- reproducibility of what ran
       definition_json TEXT,                         -- the canonical IR (ir.py)
@@ -381,97 +385,106 @@ step_outputs (run_id TEXT, step_name TEXT, output TEXT,
               PRIMARY KEY (run_id, step_name))
 ```
 
-### HTTP JSON contracts (`server.py:5`)
+### HTTP JSON contracts (`server.py`)
 
-- `POST /runs` body `{"source": "<thread program>", "inputs": {str: str}}` →
-  `201 {"run_id", "status": "pending"}`; `400` on bad JSON / missing source /
-  non-object inputs / parse error.
-- Run summary (`_run_summary`, `server.py:148`):
-  `{id, program_name, status, inputs, output, error}`; `GET /runs/{id}` adds
-  `trace: [{phase, message, data}]`.
+- `POST /runs` accepts exactly one of `{"source": "<thread program>"}` or
+  `{"ir": <workflow object>}`, plus optional `{str: str}` inputs. It returns
+  `201 {"run_id", "status": "pending"}`; malformed, oversized,
+  non-UTF-8-encodable, or policy-invalid submissions fail before enqueue.
+- Run summary (`_run_summary`, `server.py`):
+  `{id, program_name, status, inputs, output, error, created_at, updated_at,
+  program_sha256, inputs_sha256, definition_sha256, ir_version}`;
+  `GET /runs/{id}` adds `trace: [{phase, message, data}]`.
+- `GET /runs?limit=N&offset=N` is bounded/paginated. `/healthz` verifies the
+  store; `/readyz` also verifies worker liveness and reports queue depth.
 - `GET /runs/{id}/metrics` → `{"run_id", "metrics": {deterministic: {...},
-  observational: {...}}}` (shape in `metrics.py:82`).
+  observational: {...}}}` (shape in `metrics.py`).
 - `GET /metrics` → `{total_runs, by_status, success_rate, avg_duration_ms,
   total_model_calls, total_tool_calls, total_tool_errors, total_denials,
   by_program: {name: {runs, completed, failed, success_rate,
-  avg_duration_ms}}}` (`metrics.py:214`).
+  avg_duration_ms}}}` (`metrics.py`).
 
 ### TraceEvent payloads (by phase)
 
-- `context` — `{name, value}` (`runtime.py:103`)
+- `context` — `{name, value}` (`runtime.py`)
 - `step` — call `{step, model, prompt}`; output `{step, output}`; resume
-  `{step, output, resumed: true}` (`runtime.py:129`)
+  `{step, output, resumed: true}` (`runtime.py`)
 - `agent` — started `{step, model, prompt, tools, max_iters}`; turn
   `{step, turn, text, tool_calls: [{name, arguments}]}`; tool call
   `{step, tool, arguments, result}`; finished `{step, turns, output}`
-- `denial` — `{step, tool, arguments, code, result}` (`runtime.py:289`)
-- `runtime` — term eval `{source, value}` (emit-text only, `runtime.py:373`)
-- `emit` — llm call `{model, prompt}`; final `{output}` (`runtime.py:93`)
+- `route` — decision attempts/violations and chosen `{step, label, target}`
+- `contract` — rejected llm output plus the violated rules and retry attempt
+- `denial` — `{step, tool, arguments, code, result}` (`runtime.py`)
+- `runtime` — term eval `{source, value}` (emit-text only, `runtime.py`)
+- `emit` — llm call `{model, prompt}`; final `{output}` (`runtime.py`)
 
-The metrics fold (`metrics.py:128`) and the dashboard timeline both consume
+The metrics fold (`metrics.py`) and the dashboard timeline both consume
 exactly these shapes — change them in lockstep.
 
 ## Main Control Flow
 
 ### Queued path (control plane, the production shape)
 
-1. `threadlang-serve --store runs.db ...` (`server.py:197`) builds a backend
+1. `threadlang-serve --store runs.db ...` (`server.py`) builds a backend
    client, starts `WorkerPool.start()` + `ThreadingHTTPServer`
-   (`server.py:181`).
-2. `POST /runs` (`server.py:115`) validates + parses the source, then
-   `store.enqueue_run(...)` inserts a `pending` row → `201 {run_id}`.
-3. A worker's `_loop` (`control.py:93`) calls `process_one`:
-   `claim_next_pending()` atomically flips pending→running (`store.py:168`);
-   the source is re-parsed (`control.py:45`); `run_durable` executes with a
+   (`server.py`).
+2. `POST /runs` validates exactly one source/IR definition, canonicalizes it,
+   binds its digest with the inputs, then inserts a `pending` row.
+3. A worker's `_loop` (`control.py`) calls `process_one`:
+   `claim_next_pending()` atomically flips pending→running; the canonical IR
+   is loaded through the compatibility bridge; `run_durable` executes with a
    `_WriteThroughTrace` (every event lands in `events` as it happens) and a
-   step-checkpoint hook (`store.py:355`).
+   step-checkpoint hook (`store.py`).
 4. Inside `run_program`: context → steps (llm calls and/or agent tool-use
    loops) → emit, as detailed above. Success → `mark_completed`; failure →
    `mark_failed` with the error string.
 5. Clients poll `GET /runs/{id}` (status + trace) or watch
    `/ui/runs/{id}` — which meta-refreshes until the run settles
-   (`dashboard.py:244`). Metrics on `/metrics` are recomputed from the same
-   rows on each request (`store.py:277`).
-6. Crash recovery: a worker death leaves the run `running` with checkpoints
-   intact; calling `run_durable` with the same id resumes, skipping
-   checkpointed steps (`store.py:350`, `runtime.py:125`). A completed id
-   replays without model calls (`store.py:340`).
+   (`dashboard.py`). Metrics on `/metrics` are recomputed from the same
+   rows on each request (`store.py`).
+6. Crash recovery: after exclusive store ownership is reacquired on process
+   restart, sourced/IR `running` rows are requeued. The next claim resumes with
+   bound-definition checks and skips checkpointed steps. A completed id
+   replays without model calls.
 
 ### One-shot CLI path
 
 `threadlang file.thread --input k=v [--store runs.db]` → read + parse →
 select client → `run_durable` (durable) or `run_program` (ephemeral) → print
-output; on durable failure print `resume with: --store ... --resume <id>`
-(`cli.py:126`).
+output; on a retryable durable provider-call failure print `resume with:
+--store ... --resume <id>` with the original backend/endpoint/limit settings
+and a shell-quoted source.
 
 ## Error Handling
 
-- **Parse** → `ParseError(ValueError)`: bad thread wrapper (`parser.py:77`),
-  missing context (`parser.py:96`), invalid assignment (`parser.py:106`),
-  unbalanced braces (`parser.py:126`), duplicate step (`parser.py:146`),
-  invalid step body (`parser.py:180`), bad tool name / `max_iters < 1`
-  (`parser.py:194`, `parser.py:203`), missing prompt/emit/term
-  (`parser.py:173`, `parser.py:243`, `parser.py:264`). The API converts these
-  to HTTP 400 before enqueuing (`server.py:135`).
+- **Parse** → `ParseError(ValueError)`: bad thread wrapper (`parser.py`),
+  missing context, invalid assignments, unbalanced braces, duplicate or invalid
+  steps, bad tool names or iteration bounds, and missing prompt/emit/terms. The
+  API converts these to HTTP 400 before enqueuing (`server.py`).
 - **Runtime** → `RuntimeError(ValueError)`: non-agent client on an agent step
-  (`runtime.py:197`), unknown allow-listed tool (`runtime.py:205`), max_iters
-  exhaustion (`runtime.py:306`), unknown context/input/step refs
-  (`runtime.py:354`–`runtime.py:363`), unknown emit kind (`runtime.py:337`).
+  (`runtime.py`), unknown allow-listed tools, iteration exhaustion, unknown
+  context/input/step references, and unknown emit kinds.
 - **Model-call failures are wrapped**: exceptions from `complete`/`agent_step`
   re-raise as `RuntimeError` naming the step/phase, original chained via
-  `from exc` (`runtime.py:168`, `runtime.py:230`, `runtime.py:333`).
+  `from exc` (`runtime.py`).
 - **Tool failures are observable, not fatal**: a raising tool yields an
-  `"error: ..."` result string fed back to the model (`runtime.py:268`);
-  disallowed/unregistered tools yield traced denials (`runtime.py:282`).
+  `"error: ..."` result string fed back to the model (`runtime.py`);
+  disallowed/unregistered tools yield traced denials (`runtime.py`).
 - **Client construction/transport** → `LLMError(RuntimeError)`: SDK missing /
-  no key (`llm.py:138`, `llm.py:145`); HTTP status, unreachable host, non-JSON
-  body, malformed choices (`llm.py:280`–`llm.py:288`, `llm.py:344`).
-- **Durable runs**: any exception → `mark_failed` + re-raise (`store.py:370`);
-  `process_one` swallows it so the worker survives (`control.py:55`); the CLI
-  catches it and prints the resume command (`cli.py:123`).
-- **CLI**: `--resume` without `--store` → exit 2 (`cli.py:83`); run failures →
-  exit 1; malformed `--input` → `ValueError` (`cli.py:20`). Parse errors
-  surface as tracebacks (no top-level catch in `main`).
+  no key, invalid or insecure keyed endpoint, HTTP status, unreachable host,
+  non-JSON body, or malformed choices (`llm.py`).
+- **Durable runs**: any exception → `mark_failed` + re-raise (`store.py`);
+  `process_one` swallows it so the worker survives (`control.py`); the CLI
+  prints a resume command only for provider-call failures, where retrying the
+  same bound definition and inputs can make progress.
+- **CLI boundaries**: provider/runtime failures exit 1; invalid arguments,
+  source/IR, resume identity, filesystem, and sqlite failures exit 2. Common
+  operator errors are rendered as one-line diagnostics, not tracebacks.
+- **HTTP boundaries**: malformed request targets, JSON/Unicode, wrong content
+  type, invalid Host/origin/auth, oversized bodies/inputs, invalid source/IR,
+  and capacity exhaustion become explicit 4xx responses. A bad submission
+  creates no run; an execution failure becomes a failed run without killing
+  its worker.
 
 ## Config / Env Surface
 
@@ -493,6 +506,7 @@ rather than raise the numbers.
 | `MAX_REGEX_PATTERN_CHARS` / `MAX_REGEX_INPUT_CHARS` | 512 / 64 Ki | regex surface |
 | `REGEX_TIMEOUT_SECONDS` | 1.0 | per-match wall clock — the ReDoS floor |
 | `MAX_REQUEST_BYTES` | 1 MiB | HTTP body |
+| `MAX_PROVIDER_RESPONSE_BYTES` | 8 MiB | OpenAI-compatible response body |
 | `MAX_INPUTS` / `MAX_INPUT_KEY_CHARS` / `MAX_INPUT_VALUE_CHARS` | 128 / 128 / 64 Ki | run inputs |
 | `DEFAULT_MAX_PENDING_RUNS` / `DEFAULT_MAX_RETAINED_RUNS` | 1 000 / 10 000 | queue + retention |
 | `DEFAULT_LIST_LIMIT` / `MAX_LIST_LIMIT` | 100 / 1 000 | list pagination |
@@ -500,19 +514,25 @@ rather than raise the numbers.
 Fail-closed means a value over the limit is rejected, never truncated — a silently
 clipped program would execute something the author did not write.
 
-### Environment variables (all read in `llm.py`)
+### Environment variables
 
 - `ANTHROPIC_API_KEY` — `AnthropicClient` when no `api_key` passed
-  (`llm.py:143`).
+  (`llm.py`).
 - `THREADLANG_BASE_URL` — default endpoint for `OpenAICompatClient`
-  (falls back to DeepSeek, `llm.py:256`).
-- `THREADLANG_API_KEY`, then `OPENAI_API_KEY` — bearer token for
-  `OpenAICompatClient`; optional for local servers (`llm.py:261`).
+  (falls back to DeepSeek, `llm.py`).
+- `THREADLANG_API_KEY` — generic bearer token for the configured
+  OpenAI-compatible endpoint; optional for local servers and refused over
+  plain HTTP except on loopback.
+- `OPENAI_API_KEY` — fallback only for `https://api.openai.com`, never for
+  DeepSeek or an arbitrary compatible host.
+- `THREADLANG_AUTH_TOKEN` — default control-plane bearer-token variable;
+  `--auth-token-env` selects a different variable name.
 
-CLI flags: see `cli.py` (`threadlang`), `server.py:202` (`threadlang-serve`),
-`app.py:64` (`support-triage`). Backend defaults differ deliberately:
-`threadlang` defaults to `anthropic` with soft fallback; `threadlang-serve`
-and `support-triage` default to `dry-run`.
+CLI flags: see `cli.py` (`threadlang`), `server.py` (`threadlang-serve`),
+`app.py` (`support-triage`). Backend defaults differ deliberately:
+`threadlang` defaults to `anthropic` and fails closed when a model workflow
+cannot construct it; `threadlang-serve` and `support-triage` default to
+explicit `dry-run`.
 
 Programmatic knobs: `AnthropicClient(api_key, max_tokens=1024)`;
 `OpenAICompatClient(base_url, api_key, max_tokens=1024, timeout=120.0)`;
@@ -520,7 +540,7 @@ Programmatic knobs: `AnthropicClient(api_key, max_tokens=1024)`;
 port=8765, n_workers=2, llm_client, tools)`; `run_program(tools=...)` /
 `run_durable(run_id=...)`.
 
-Packaging: zero runtime deps (`pyproject.toml:13`); optional extra
-`anthropic>=0.40,<1.0` (`pyproject.toml:16`); `requires-python >= 3.10`
-(`pyproject.toml:10`); `triage.thread` ships as package data
-(`pyproject.toml:23`). No settings file or dotenv loading exists.
+Packaging: zero runtime deps (`pyproject.toml`); optional extra
+`anthropic>=0.40,<1.0` (`pyproject.toml`); `requires-python >= 3.11`
+(`pyproject.toml`); `triage.thread` ships as package data
+(`pyproject.toml`). No settings file or dotenv loading exists.

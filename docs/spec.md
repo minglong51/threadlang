@@ -72,11 +72,13 @@ term        = string | "context." name | "inputs." name
 
 The language semantics are independent of storage. The bundled durable runtime
 provides step-boundary checkpoints on one POSIX process and one local SQLite
-store. It binds a run to hashes of its source and canonical inputs and rejects
-concurrent resume with a compare-and-swap transition. A hard crash may repeat
-the current incomplete LLM/agent step; this is not deterministic event-history
-replay. Side-effecting tools must be declared idempotent to run durably. The
-full operational contract is [`production.md`](production.md).
+store. It binds a v0.13 run to its canonical Workflow IR and canonical inputs;
+the source digest is retained as metadata and as the legacy resume fence for
+rows without IR identity. Concurrent resume is rejected with a compare-and-swap
+transition. A hard crash may repeat the current incomplete LLM/agent step; this
+is not deterministic event-history replay. Side-effecting tools must be
+declared idempotent to run durably. The full operational contract is
+[`production.md`](production.md).
 
 ### Step graph (v0.9)
 
@@ -179,8 +181,9 @@ threadlang <source.thread> [--input k=v ...] [--dry-run] [--trace]
 - `--input` is repeatable. Keys are referenced as `inputs.<key>`.
 - `--dry-run` uses `DryRunClient` even if the Anthropic SDK + API key are
   available.
-- If the Anthropic SDK / key are missing and the program needs an LLM
-  call, the CLI falls back to `DryRunClient` with a warning rather than
-  erroring out — useful for "does my program parse and route values
-  correctly" checks.
+- If the selected real provider cannot be constructed and the program needs a
+  model call, the CLI exits with an error. It never turns a real run into
+  synthetic dry-run output; use `--dry-run` explicitly for plumbing checks.
+- A program with no model steps and `emit text` still runs without a provider,
+  because its selected client is never called.
 - `--trace` prints structured trace events to stderr after the output.
