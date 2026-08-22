@@ -20,8 +20,11 @@ The current source version is **v0.13.3 (alpha)**. It includes:
   established AST runtime.
 
 The support boundary is deliberately narrow: one POSIX process, one local
-SQLite store, and at-least-once LLM calls across a hard crash. Design records
-and deliberate cuts live in [`docs/design/`](docs/design/).
+SQLite store, and journaled LLM calls that re-execute at most the single
+in-flight call of the interrupted step across a hard crash. Design records
+and deliberate cuts live in [`docs/design/`](docs/design/); the boundary is
+scored against the published seven durable-execution criteria in
+[`docs/durability-conformance.md`](docs/durability-conformance.md).
 
 ```thread
 thread TwoStep {
@@ -196,9 +199,10 @@ finally:
 
 The runtime stays storage-agnostic — `run_durable` hands it a write-through
 trace and a checkpoint callback, so the same executor runs durable or
-ephemeral. Checkpoints are step-level; a crash mid-step re-runs that step,
-finished steps are reused. Replaying a *completed* run returns the stored
-result and makes no model calls. Details:
+ephemeral. Checkpoints are step-level; a crash mid-step re-runs that step (its
+completed model calls replay from the run's journal — only the in-flight call
+re-executes), finished steps are reused. Replaying a *completed* run returns
+the stored result and makes no model calls. Details:
 [`docs/design/phase-2-durability.md`](docs/design/phase-2-durability.md).
 
 ## Control plane (v0.5)
@@ -552,8 +556,9 @@ platform. Each shipped layer keeps the determinism/trace bet:
     parser hardening, authenticated single-node control plane, source/input
     integrity binding, exclusive worker ownership, CAS resume, packaging,
     security gates, and a non-root container. The support boundary is one POSIX
-    process and one local SQLite store; LLM calls remain at-least-once across a
-    hard crash. See [`docs/production.md`](docs/production.md),
+    process and one local SQLite store; journaled LLM calls re-execute at most
+    the single in-flight call across a hard crash. See
+    [`docs/production.md`](docs/production.md),
     [`SECURITY.md`](SECURITY.md), and the
     [semantic comparison](docs/benchmarks/dsl-comparison.md).
 11. **Canonical Workflow IR** *(v0.13, shipped)* — deterministic JSON and
