@@ -238,6 +238,8 @@ The control-plane server also hosts a read-only dashboard over the persisted
 trace — no extra process, no build step, no JavaScript. The trace has been the
 durable record since v0.1; this is the layer that lets a human read it.
 
+![run detail in the built-in dashboard — status, step/model-call/tool-call counts, inputs, output, and the persisted trace timeline for examples/release_report.thread run with --dry-run](docs/dashboard.png)
+
 ```bash
 threadlang-serve --store runs.db --port 8765 --workers 2 --backend openai
 # then open:
