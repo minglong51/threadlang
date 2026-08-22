@@ -1,6 +1,6 @@
 # ThreadLang — Low-Level Design
 
-Refreshed for v0.13.3. The supported boundary is one POSIX process and one local
+Refreshed for v0.14.0. The supported boundary is one POSIX process and one local
 SQLite store; see [`../production.md`](../production.md). Historical line
 references elsewhere in this document are explanatory and not API contracts.
 

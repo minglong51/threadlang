@@ -1,6 +1,6 @@
 # ThreadLang — High-Level Design
 
-*Refreshed for v0.13.3. Source line numbers are intentionally omitted where they
+*Refreshed for v0.14.0. Source line numbers are intentionally omitted where they
 would make the design document brittle.*
 
 The supported production boundary is one POSIX process and one local SQLite

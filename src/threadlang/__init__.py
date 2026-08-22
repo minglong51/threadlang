@@ -37,7 +37,7 @@ from .server import make_server, serve
 from .store import DurableRun, RunRecord, RunStore, RunStoreCapacityError, run_durable
 from .tools import FunctionTool, Tool, ToolRegistry, ToolSpec, default_registry
 
-__version__ = "0.13.3"
+__version__ = "0.14.0"
 
 __all__ = [
     "parse_program",
