@@ -4,8 +4,9 @@
 would make the design document brittle.*
 
 The supported production boundary is one POSIX process and one local SQLite
-store. "Durable" below means step-boundary checkpoints and crash recovery, not
-deterministic event-history replay. See [`../production.md`](../production.md).
+store. "Durable" below means step-boundary checkpoints, per-call model-call
+journaling, and crash recovery, not deterministic event-history replay. See
+[`../production.md`](../production.md).
 
 ## Purpose
 
@@ -84,7 +85,8 @@ JS build (server-rendered HTML with inline CSS, `dashboard.py`).
 | `src/threadlang/llm.py` | Client backends behind a baseline protocol plus optional capabilities: `LLMClient.complete`, `AgentLLMClient.agent_step`, and `RouteLLMClient.route`. `DryRunClient` (deterministic echo + two-phase agent stub), `OpenAICompatClient` (stdlib HTTP), `AnthropicClient` (SDK). |
 | `src/threadlang/tools.py` | The agent execution boundary: `ToolSpec`/`Tool`/`FunctionTool`, `ToolRegistry` allow-list, deterministic built-ins `echo` + `calculator` (AST-walked arithmetic, no `eval`, no `**`, `tools.py`). |
 | `src/threadlang/trace.py` | `TraceEvent(phase, message, data)`, `Trace` alias, `DenialCode` enum. The durable record's unit. |
-| `src/threadlang/store.py` | Durability (L3): `RunStore` (sqlite tables `runs`/`events`/`step_outputs`, WAL/autocommit), canonical definition/input binding with legacy source fencing, bounded queue/retention, CAS resume, write-through traces, step checkpoints, replay, and metrics queries. |
+| `src/threadlang/store.py` | Durability (L3): `RunStore` (sqlite tables `runs`/`events`/`step_outputs`/`llm_journal`, WAL/autocommit), canonical definition/input binding with legacy source fencing, bounded queue/retention, CAS resume, write-through traces, step checkpoints, replay, and metrics queries. |
+| `src/threadlang/journal.py` | Per-call LLM response journal for durable runs: `run_durable` wraps the run's client in `JournaledLLMClient`, which records request fingerprints + responses in `llm_journal` and replays fingerprint-matched responses on resume — a crash re-executes at most the interrupted step's single in-flight model call. |
 | `src/threadlang/control.py` | Control plane workers (L4): exclusive per-store process lock, orphan requeue, atomic claim, source-or-IR execution, per-thread stores, exception-contained worker loops, and readiness state. |
 | `src/threadlang/server.py` | Authenticated stdlib JSON API + dashboard host: source-or-IR `POST /runs`, paginated run queries, metrics, liveness/readiness, Host/origin/body/input admission checks, and HTML views. `serve()` starts the exclusive worker pool and server together. |
 | `src/threadlang/dashboard.py` | Observability (L5): pure `(record, events, metrics) -> HTML` renderers for the run list (with aggregate panel) and per-run trace timeline; everything `html.escape`d; meta-refresh while a run is in flight. |

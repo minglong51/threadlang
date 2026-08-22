@@ -7,8 +7,8 @@ ThreadLang v0.13 retains the deliberately narrow **single-node, POSIX, local-fil
 - One `threadlang-serve` process per SQLite store.
 - Linux or macOS/POSIX filesystem with working advisory file locks.
 - SQLite WAL on a local disk; network filesystems are unsupported.
-- Step-boundary checkpoints. A process death can repeat model/tool calls in the current incomplete step, or an incomplete `emit llm`.
-- Model and tool calls are therefore at-least-once. Durable runs reject custom tools declared as both side-effecting and non-idempotent.
+- Step-boundary checkpoints, with every model call journaled per run. A process death re-executes the interrupted step, but that step's completed model calls — including a completed `emit llm` — replay from the journal; at most the single in-flight model call repeats. Tool calls in the interrupted step re-execute.
+- Model calls are therefore journaled-replayable and tool calls remain at-least-once. Durable runs reject custom tools declared as both side-effecting and non-idempotent.
 - Forward-only graphs only; `max_iters` is capped by runtime policy.
 
 ## Start safely
@@ -56,11 +56,11 @@ The worker pool owns `<store>.worker.lock`. A second process fails startup rathe
 - Regex output contracts execute in a killable isolated interpreter with size and time limits.
 - Non-idempotent side-effecting tools are rejected on the durable path.
 
-Model and tool calls, including `emit llm`, remain at-least-once across a hard crash. Tool authors must truthfully declare `ToolSpec.side_effects` and `ToolSpec.idempotent`. Exactly-once external effects are out of scope.
+Model calls, including `emit llm`, are journaled per run: across a hard crash the interrupted step's completed calls replay from the journal and at most the single in-flight call re-executes; tool calls in the interrupted step remain at-least-once. Tool authors must truthfully declare `ToolSpec.side_effects` and `ToolSpec.idempotent`. Exactly-once external effects are out of scope.
 
 ## Data and secrets
 
-SQLite stores inputs, outputs, traces, and tool observations in plaintext. Protect the database and lock file using OS permissions and encrypted storage where required. For the OpenAI-compatible client, HTTP response bodies and endpoint details are not copied into durable errors, redirects are refused, endpoint URLs cannot embed credentials, queries, or fragments, keyed non-loopback endpoints require HTTPS, loopback HTTP bypasses environment proxies, and responses are capped at 8 MiB. Malformed OpenAI-compatible text and tool-call payloads fail before persistence or tool execution. Retention is count-based; legal/time-based erasure remains an operator responsibility.
+SQLite stores inputs, outputs, traces, tool observations, and journaled model request/response payloads in plaintext. Protect the database and lock file using OS permissions and encrypted storage where required. For the OpenAI-compatible client, HTTP response bodies and endpoint details are not copied into durable errors, redirects are refused, endpoint URLs cannot embed credentials, queries, or fragments, keyed non-loopback endpoints require HTTPS, loopback HTTP bypasses environment proxies, and responses are capped at 8 MiB. Malformed OpenAI-compatible text and tool-call payloads fail before persistence or tool execution. Retention is count-based; legal/time-based erasure remains an operator responsibility.
 
 ## Upgrade to v0.13
 

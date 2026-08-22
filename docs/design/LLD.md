@@ -4,9 +4,10 @@ Refreshed for v0.13.3. The supported boundary is one POSIX process and one local
 SQLite store; see [`../production.md`](../production.md). Historical line
 references elsewhere in this document are explanatory and not API contracts.
 
-> **Refreshed 2026-08-19.** Covers the shipped canonical-IR execution and
-> durable-binding path plus the v0.12 admission, recovery, and ownership
-> hardening. Where this disagrees with the code, the code wins.
+> **Refreshed 2026-08-22.** Covers the shipped canonical-IR execution and
+> durable-binding path, the v0.12 admission, recovery, and ownership
+> hardening, and per-call LLM response journaling on the durable path
+> (`journal.py`). Where this disagrees with the code, the code wins.
 
 ## Module Breakdown
 
@@ -194,15 +195,41 @@ the shared-client `WorkerPool` relies on (`control.py`).
   under `BEGIN IMMEDIATE`. `claim_next_pending()` atomically claims the oldest
   row. `requeue_orphans()` moves restart-stranded sourced/IR runs back to
   `pending`.
-- Events are sequenced and timestamped; step outputs are upserted checkpoints.
-  Per-run and aggregate metrics are folds over those persisted events.
+- Events are sequenced and timestamped; step outputs are upserted checkpoints;
+  journaled model calls are appended with a per-run `call_seq` and looked up
+  by `(run_id, request_fingerprint, occurrence)`. Per-run and aggregate
+  metrics are folds over those persisted events.
 - `run_durable(...)` compiles the current program to canonical IR and binds its
   digest with canonical inputs. The source digest remains metadata and the
   identity fence for legacy rows lacking canonical definition identity. Resume
   verifies stored IR integrity, definition/input identity, IR version, and
   eligible status before it loads checkpoints. A completed run replays without
   model calls; a fresh run moves `created→running`; any execution exception
-  marks `failed`; success marks `completed`.
+  marks `failed`; success marks `completed`. Unless `journal_llm=False`, the
+  run's LLM client is wrapped in `JournaledLLMClient` (`journal.py`) before
+  `run_program` sees it, so a resumed run replays the interrupted step's
+  completed model calls from `llm_journal` and re-executes at most the single
+  in-flight call.
+
+### `journal.py` — per-call LLM response journal
+
+- `JournaledLLMClient(client, store, run_id)` (`journal.py`) — the per-run
+  wrapper `run_durable` installs. It exposes `complete` unconditionally and
+  `route`/`agent_step` only when the wrapped client has them (class-level
+  annotations, conditionally assigned in `__init__`), so the runtime's
+  `getattr` capability probes see exactly the wrapped client's surface.
+- Every call is keyed by `(run_id, request_fingerprint, occurrence)`: the
+  fingerprint is SHA-256 over the canonical JSON of the full request (`kind`
+  + `model` + prompt / options / messages+tools; `ToolCall`-carrying messages
+  and `ToolSpec`s serialize via `dataclasses.asdict`), and `occurrence` is the
+  per-attempt ordinal of that fingerprint, so two identical requests in one
+  run keep distinct rows (`journal.py`).
+- A journal hit replays the recorded response with no provider call —
+  `agent_step` payloads reconstruct an `AgentTurn` (`_agent_turn_from_json`,
+  `journal.py`); a miss calls through and persists request + response JSON. A
+  fresh run_id starts with an empty journal, so first attempts always call
+  live; only resumed runs replay. Tool calls are not journaled and
+  re-execute; exactly-once remains out of scope (`docs/production.md`).
 
 ### `control.py` — worker pool
 
@@ -391,6 +418,11 @@ events (run_id TEXT, seq INTEGER, phase TEXT, message TEXT,
         PRIMARY KEY (run_id, seq))
 step_outputs (run_id TEXT, step_name TEXT, output TEXT,
               PRIMARY KEY (run_id, step_name))
+llm_journal (run_id TEXT, call_seq INTEGER,             -- append order within the run
+             request_fingerprint TEXT,                  -- sha256 of canonical request JSON
+             occurrence INTEGER,                        -- per-attempt ordinal of the fingerprint
+             request_json TEXT, response_json TEXT, created_at TEXT,
+             PRIMARY KEY (run_id, call_seq))
 ```
 
 ### HTTP JSON contracts (`server.py`)
@@ -547,7 +579,7 @@ Programmatic knobs: `AnthropicClient(api_key, max_tokens=1024)`;
 `OpenAICompatClient(base_url, api_key, max_tokens=1024, timeout=120.0)`;
 `WorkerPool(n_workers=2, poll_interval=0.05)`; `serve(host="127.0.0.1",
 port=8765, n_workers=2, llm_client, tools)`; `run_program(tools=...)` /
-`run_durable(run_id=...)`.
+`run_durable(run_id=..., journal_llm=...)`.
 
 Packaging: zero runtime deps (`pyproject.toml`); optional extra
 `anthropic>=0.40,<1.0` (`pyproject.toml`); `requires-python >= 3.11`

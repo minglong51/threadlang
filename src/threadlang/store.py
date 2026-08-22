@@ -9,16 +9,20 @@ resume from the last completed step instead of re-running from the top.
 The design keeps the runtime storage-agnostic. This module supplies:
 
 - `RunStore` — a thin sqlite wrapper (stdlib `sqlite3`, no dependency) holding
-  three tables: `runs`, `events`, `step_outputs`.
+  four tables: `runs`, `events`, `step_outputs`, and `llm_journal` (the
+  per-call model-call journal; see journal.py).
 - `run_durable()` — orchestrates a persisted run: it hands the runtime a
   write-through trace (every appended event lands in `events`) and a
-  step-complete hook (every step output lands in `step_outputs`), then marks
-  the run completed or failed. On resume it pre-loads the completed step
-  outputs and tells the runtime to skip them.
+  step-complete hook (every step output lands in `step_outputs`), wraps the
+  LLM client in a per-call journaling wrapper, then marks the run completed
+  or failed. On resume it pre-loads the completed step outputs and tells the
+  runtime to skip them.
 
 Checkpoint granularity is one step. A crash *inside* a step (mid agent loop)
-re-runs that whole step on resume; steps that already finished do not. That is
-the right boundary for v0.4 — coarse enough to be simple and correct, fine
+re-runs that whole step on resume; steps that already finished do not. Within
+the re-run step, model calls completed before the crash replay from
+`llm_journal` — at most the single in-flight call re-executes. That is the
+right boundary — coarse enough to be simple and correct, fine
 enough that a long pipeline doesn't redo completed work.
 """
 
@@ -40,7 +44,8 @@ from .ir import (
     load_ir_bytes,
     workflow_fingerprint,
 )
-from .llm import LLMClient
+from .journal import JournaledLLMClient
+from .llm import DryRunClient, LLMClient
 from .metrics import AggregateMetrics, RunMetrics, aggregate, compute_metrics, trace_span_ms
 from .policy import DEFAULT_MAX_PENDING_RUNS, DEFAULT_MAX_RETAINED_RUNS
 from .runtime import RuntimeResult, run_program
@@ -81,9 +86,22 @@ CREATE TABLE IF NOT EXISTS step_outputs (
     PRIMARY KEY (run_id, step_name),
     FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS llm_journal (
+    run_id              TEXT NOT NULL,
+    call_seq            INTEGER NOT NULL,   -- append order within the run
+    request_fingerprint TEXT NOT NULL,      -- sha256 of the canonical request JSON
+    occurrence          INTEGER NOT NULL,   -- per-attempt ordinal of this fingerprint
+    request_json        TEXT NOT NULL,
+    response_json       TEXT NOT NULL,
+    created_at          TEXT NOT NULL,
+    PRIMARY KEY (run_id, call_seq),
+    FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
+);
 CREATE INDEX IF NOT EXISTS idx_runs_status_created ON runs(status, created_at, id);
 CREATE INDEX IF NOT EXISTS idx_runs_created ON runs(created_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id, seq);
+CREATE INDEX IF NOT EXISTS idx_llm_journal_lookup
+    ON llm_journal(run_id, request_fingerprint, occurrence);
 """
 
 
@@ -357,6 +375,7 @@ class RunStore:
             # foreign-key declarations existed.
             self._conn.execute("DELETE FROM events WHERE run_id = ?", (run_id,))
             self._conn.execute("DELETE FROM step_outputs WHERE run_id = ?", (run_id,))
+            self._conn.execute("DELETE FROM llm_journal WHERE run_id = ?", (run_id,))
             self._conn.execute("DELETE FROM runs WHERE id = ?", (run_id,))
         return len(ids)
 
@@ -512,6 +531,47 @@ class RunStore:
         ).fetchall()
         return {r["step_name"]: r["output"] for r in rows}
 
+    # ----- LLM call journal (the replay half of journal.py) -----
+
+    def load_llm_journal_entry(
+        self, run_id: str, request_fingerprint: str, occurrence: int
+    ) -> Optional[str]:
+        """The recorded response JSON for the `occurrence`-th call with this
+        request fingerprint in `run_id`, or None — in which case the caller
+        must go live and then persist via `save_llm_journal_entry`."""
+        row = self._conn.execute(
+            "SELECT response_json FROM llm_journal "
+            "WHERE run_id = ? AND request_fingerprint = ? AND occurrence = ?",
+            (run_id, request_fingerprint, occurrence),
+        ).fetchone()
+        return row["response_json"] if row is not None else None
+
+    def save_llm_journal_entry(
+        self,
+        run_id: str,
+        request_fingerprint: str,
+        occurrence: int,
+        request_json: str,
+        response_json: str,
+    ) -> None:
+        row = self._conn.execute(
+            "SELECT COALESCE(MAX(call_seq), -1) + 1 AS next FROM llm_journal WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        self._conn.execute(
+            "INSERT INTO llm_journal (run_id, call_seq, request_fingerprint, occurrence, "
+            "request_json, response_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                run_id,
+                row["next"],
+                request_fingerprint,
+                occurrence,
+                request_json,
+                response_json,
+                _now(),
+            ),
+        )
+
     # ----- metrics (a derived view of the persisted trace) -----
 
     def _event_timestamps(self, run_id: str) -> List[Optional[str]]:
@@ -580,6 +640,7 @@ def run_durable(
     run_id: Optional[str] = None,
     source: Optional[str] = None,
     claimed: bool = False,
+    journal_llm: bool = True,
 ) -> DurableRun:
     """Execute a program with its trace and step checkpoints persisted to
     `store`.
@@ -589,6 +650,13 @@ def run_durable(
     one. Passing the id of an active run is rejected; passing a `completed` run
     returns its stored result without re-executing. Omit `run_id` to start a
     fresh run. Queue workers set `claimed=True` only after an atomic claim.
+
+    Model calls are journaled per call (`journal_llm=False` opts out): on
+    resume, a call whose request fingerprint matches a journaled row replays
+    the recorded response instead of re-calling the provider, so a crash
+    re-executes at most the interrupted step's single in-flight call. A fresh
+    run always calls live. Exactly-once stays out of scope; see journal.py and
+    docs/production.md.
     """
     if tools is not None:
         for step in program.steps.steps:
@@ -690,6 +758,14 @@ def run_durable(
 
     trace = _WriteThroughTrace(store, run_id)
 
+    client: LLMClient = llm_client if llm_client is not None else DryRunClient()
+    if journal_llm:
+        # Per-call response journal: on resume, the interrupted step's
+        # completed calls replay from `llm_journal`; at most the call that was
+        # in flight at crash time re-executes. A fresh run_id's journal is
+        # empty, so a first attempt always calls live.
+        client = JournaledLLMClient(client, store, run_id)
+
     def _checkpoint(step_name: str, output: str) -> None:
         store.save_step_output(run_id, step_name, output)
 
@@ -697,7 +773,7 @@ def run_durable(
         result = run_program(
             program,
             inputs,
-            llm_client=llm_client,
+            llm_client=client,
             tools=tools,
             trace=trace,
             resume_outputs=resume_outputs,
